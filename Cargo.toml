@@ -1,0 +1,67 @@
+[package]
+name = "tren"
+version = "0.2.0"
+edition = "2021"
+
+[lib]
+name = "tren"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+
+[[bin]]
+name = "tren-wrapper"
+path = "src/bin/tren_wrapper.rs"
+
+[[bin]]
+name = "qsub"
+path = "src/bin/qsub.rs"
+
+[[bin]]
+name = "qstat"
+path = "src/bin/qstat.rs"
+
+[[bin]]
+name = "qlog"
+path = "src/bin/qlog.rs"
+
+[[bin]]
+name = "qwait"
+path = "src/bin/qwait.rs"
+
+[[bin]]
+name = "qowner"
+path = "src/bin/qowner.rs"
+
+[[bin]]
+name = "qmap"
+path = "src/bin/qmap.rs"
+
+[[bin]]
+name = "qbind"
+path = "src/bin/qbind.rs"
+
+[[bin]]
+name = "qworkdir"
+path = "src/bin/qworkdir.rs"
+
+[[bin]]
+name = "qclone"
+path = "src/bin/qclone.rs"
+
+[[bin]]
+name = "qwait-mark"
+path = "src/bin/qwait_mark.rs"
+
+[[bin]]
+name = "qrun"
+path = "src/bin/qrun.rs"
+
+[[bin]]
+name = "qdel"
+path = "src/bin/qdel.rs"
+
+[[bin]]
+name = "bench_idtree"
+path = "src/bin/bench_idtree.rs"

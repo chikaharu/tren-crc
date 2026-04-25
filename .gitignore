@@ -1,0 +1,8 @@
+target/
+scheduler.sock
+logs/
+scheduler.serial
+._qsched*/
+scheduler-node-*.sock
+scheduler-node-*.serial
+logs-node-*/
