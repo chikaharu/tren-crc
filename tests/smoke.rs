@@ -354,18 +354,22 @@
       };
   }
 
-  /// Primary: explicit exit code N — expects qsub to forward N and the
-  /// node state to be DONE(N).
+  /// Primary: explicit exit code N — qsub itself exits 0 only when the
+  /// node finished DONE(0); for any nonzero code it exits 1. The actual
+  /// exit code is preserved in the node state file as DONE(N).
   macro_rules! p_exit {
       ($name:ident, $code:expr) => {
           #[test]
           fn $name() {
               let sb = Sandbox::new(stringify!($name));
               let cmd = format!("exit {}", $code);
-              let (rc, stdout, _stderr) = sb.qsub_raw(&[&cmd]);
+              let (rc, stdout, stderr) = sb.qsub_raw(&[&cmd]);
               let addr = stdout.trim();
               assert!(!addr.is_empty(), "no bit_addr returned");
-              assert_eq!(rc, $code, "qsub should forward exit code {}", $code);
+              let expected_rc: i32 = if $code == 0 { 0 } else { 1 };
+              assert_eq!(rc, expected_rc,
+                  "qsub rc for exit {} should be {} (stderr: {})",
+                  $code, expected_rc, stderr);
               let state = sb.read_node_state(addr);
               assert_eq!(state, format!("DONE({})", $code));
           }
@@ -408,7 +412,9 @@
       };
   }
 
-  /// Edge: failing command must propagate non-zero exit.
+  /// Edge: failing command must propagate non-zero exit. qsub itself
+  /// returns 1 for any nonzero job exit code; the exact code is recorded
+  /// in the node state file as DONE(N).
   macro_rules! e_fail {
       ($name:ident, $code:expr) => {
           #[test]
@@ -418,7 +424,9 @@
               let (rc, stdout, stderr) = sb.qsub_raw(&[&cmd]);
               let addr = stdout.trim();
               assert!(!addr.is_empty());
-              assert_eq!(rc, $code, "expected exit {}, got {} (stderr: {})", $code, rc, stderr);
+              assert_eq!(rc, 1,
+                  "qsub rc for nonzero exit {} should be 1 (stderr: {})",
+                  $code, stderr);
               let state = sb.read_node_state(addr);
               assert_eq!(state, format!("DONE({})", $code));
           }
