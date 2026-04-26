@@ -149,9 +149,9 @@
       assert!(!addr.is_empty(),
           "qsub should still print the bit_addr (got stdout {:?})", stdout);
       assert_eq!(rc, 1,
-          "qsub of \`false\` should exit 1 (stderr: {})", stderr);
+          "qsub of `false` should exit 1 (stderr: {})", stderr);
       assert!(stderr.contains("[qsub] exit=1"),
-          "stderr should contain \`[qsub] exit=1\`, got: {}", stderr);
+          "stderr should contain `[qsub] exit=1`, got: {}", stderr);
       let state = sb.read_node_state(addr);
       assert!(
           state.starts_with("DONE(") && state != "DONE(0)",
