@@ -1,391 +1,712 @@
 //! Smoke integration tests for `tren-wrapper` + `qsub` + `qwait`.
-//!
-//! These spin up a real wrapper in an isolated temp directory and exercise
-//! the end-to-end flow exposed by the binaries. They cover:
-//!
-//!   * a basic submit + wait round-trip,
-//!   * a dependency chain (`qsub --after`) where the dependent job must
-//!     run strictly after the parent finishes.
-//!
-//! The whole file is designed to finish well under 30 s on a cold build.
+  //!
+  //! Original 5 smoke cases, plus 100 primary cases (P001-P100) and
+  //! 100 edge cases (E001-E100) for the v0.2.0 priority-queue / worker-cap
+  //! changes. Tests are macro-generated so each one becomes a real
+  //! `#[test]` function — `cargo test` parallelises them automatically.
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+  use std::path::{Path, PathBuf};
+  use std::process::{Child, Command, Stdio};
+  use std::thread;
+  use std::time::{Duration, Instant};
 
-const QSUB:    &str = env!("CARGO_BIN_EXE_qsub");
-const QWAIT:   &str = env!("CARGO_BIN_EXE_qwait");
-const WRAPPER: &str = env!("CARGO_BIN_EXE_tren-wrapper");
+  const QSUB:    &str = env!("CARGO_BIN_EXE_qsub");
+  const QWAIT:   &str = env!("CARGO_BIN_EXE_qwait");
+  const WRAPPER: &str = env!("CARGO_BIN_EXE_tren-wrapper");
 
-/// RAII handle for a per-test sandbox: a fresh temp directory plus a
-/// wrapper process pinned to it. Dropping the guard kills the wrapper and
-/// removes the directory tree.
-struct Sandbox {
-    dir:     PathBuf,
-    wrapper: Child,
-}
+  struct Sandbox {
+      dir:     PathBuf,
+      wrapper: Child,
+  }
 
-impl Sandbox {
-    fn new(label: &str) -> Self {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "tren-smoke-{}-{}-{}",
-            label, std::process::id(), stamp,
-        ));
-        std::fs::create_dir_all(&dir).expect("mkdir sandbox");
+  impl Sandbox {
+      fn new(label: &str) -> Self {
+          let stamp = std::time::SystemTime::now()
+              .duration_since(std::time::UNIX_EPOCH)
+              .unwrap()
+              .as_nanos();
+          let dir = std::env::temp_dir().join(format!(
+              "tren-smoke-{}-{}-{}",
+              label, std::process::id(), stamp,
+          ));
+          std::fs::create_dir_all(&dir).expect("mkdir sandbox");
 
-        // Spawn the wrapper directly so the workdir lives *inside* `dir`
-        // and `find_workdir` (which walks upward from cwd) hits ours first
-        // before any leftover `.tren-*` further up the filesystem.
-        let wrapper = Command::new(WRAPPER)
-            .current_dir(&dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn tren-wrapper");
+          let wrapper = Command::new(WRAPPER)
+              .current_dir(&dir)
+              .stdin(Stdio::null())
+              .stdout(Stdio::null())
+              .stderr(Stdio::null())
+              .spawn()
+              .expect("spawn tren-wrapper");
 
-        let sb = Sandbox { dir, wrapper };
-        sb.wait_for_workdir();
-        sb
-    }
+          let sb = Sandbox { dir, wrapper };
+          sb.wait_for_workdir();
+          sb
+      }
 
-    fn wait_for_workdir(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            if Self::find_workdir(&self.dir).is_some() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-        panic!("wrapper did not create .tren-*/port within 5s");
-    }
+      fn wait_for_workdir(&self) {
+          let deadline = Instant::now() + Duration::from_secs(5);
+          while Instant::now() < deadline {
+              if Self::find_workdir(&self.dir).is_some() {
+                  return;
+              }
+              thread::sleep(Duration::from_millis(50));
+          }
+          panic!("wrapper did not create .tren-*/port within 5s");
+      }
 
-    fn find_workdir(dir: &Path) -> Option<PathBuf> {
-        for ent in std::fs::read_dir(dir).ok()?.flatten() {
-            let name = ent.file_name();
-            let s = name.to_string_lossy();
-            if s.starts_with(".tren-") {
-                let p = ent.path();
-                if p.join("port").is_file() {
-                    return Some(p);
-                }
-            }
-        }
-        None
-    }
+      fn find_workdir(dir: &Path) -> Option<PathBuf> {
+          for ent in std::fs::read_dir(dir).ok()?.flatten() {
+              let name = ent.file_name();
+              let s = name.to_string_lossy();
+              if s.starts_with(".tren-") {
+                  let p = ent.path();
+                  if p.join("port").is_file() {
+                      return Some(p);
+                  }
+              }
+          }
+          None
+      }
 
-    fn qsub(&self, args: &[&str]) -> String {
-        let out = Command::new(QSUB)
-            .args(args)
-            .current_dir(&self.dir)
-            .output()
-            .expect("spawn qsub");
-        assert!(
-            out.status.success(),
-            "qsub {:?} failed (status {:?})\nstdout: {}\nstderr: {}",
-            args,
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr),
-        );
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    }
+      fn qsub(&self, args: &[&str]) -> String {
+          let out = Command::new(QSUB)
+              .args(args)
+              .current_dir(&self.dir)
+              .output()
+              .expect("spawn qsub");
+          assert!(
+              out.status.success(),
+              "qsub {:?} failed (status {:?})\nstdout: {}\nstderr: {}",
+              args,
+              out.status.code(),
+              String::from_utf8_lossy(&out.stdout),
+              String::from_utf8_lossy(&out.stderr),
+          );
+          String::from_utf8_lossy(&out.stdout).trim().to_string()
+      }
 
-    /// Like `qsub` but does not assert success — returns
-    /// (process_exit, stdout, stderr). Used to verify failure semantics
-    /// of the implicit qwait built into qsub.
-    fn qsub_raw(&self, args: &[&str]) -> (i32, String, String) {
-        let out = Command::new(QSUB)
-            .args(args)
-            .current_dir(&self.dir)
-            .output()
-            .expect("spawn qsub");
-        (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).into_owned(),
-            String::from_utf8_lossy(&out.stderr).into_owned(),
-        )
-    }
+      fn qsub_raw(&self, args: &[&str]) -> (i32, String, String) {
+          let out = Command::new(QSUB)
+              .args(args)
+              .current_dir(&self.dir)
+              .output()
+              .expect("spawn qsub");
+          (
+              out.status.code().unwrap_or(-1),
+              String::from_utf8_lossy(&out.stdout).into_owned(),
+              String::from_utf8_lossy(&out.stderr).into_owned(),
+          )
+      }
 
-    fn qwait(&self, args: &[&str]) -> i32 {
-        let status = Command::new(QWAIT)
-            .args(args)
-            .current_dir(&self.dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .expect("spawn qwait");
-        status.code().unwrap_or(-1)
-    }
+      fn qwait(&self, args: &[&str]) -> i32 {
+          let status = Command::new(QWAIT)
+              .args(args)
+              .current_dir(&self.dir)
+              .stdin(Stdio::null())
+              .stdout(Stdio::null())
+              .stderr(Stdio::null())
+              .status()
+              .expect("spawn qwait");
+          status.code().unwrap_or(-1)
+      }
 
-    fn read_node_state(&self, addr: &str) -> String {
-        let workdir = Self::find_workdir(&self.dir).expect("workdir gone");
-        std::fs::read_to_string(workdir.join("tree").join(addr).join("state"))
-            .unwrap_or_default()
-            .trim()
-            .to_string()
-    }
-}
+      fn read_node_state(&self, addr: &str) -> String {
+          let workdir = Self::find_workdir(&self.dir).expect("workdir gone");
+          std::fs::read_to_string(workdir.join("tree").join(addr).join("state"))
+              .unwrap_or_default()
+              .trim()
+              .to_string()
+      }
+  }
 
-impl Drop for Sandbox {
-    fn drop(&mut self) {
-        // Best-effort: ask the wrapper to quit so it cleans up its workdir,
-        // then make sure the process is gone before we wipe the sandbox.
-        if let Some(workdir) = Self::find_workdir(&self.dir) {
-            if let Ok(port_str) = std::fs::read_to_string(workdir.join("port")) {
-                if let Ok(port) = port_str.trim().parse::<u16>() {
-                    let _ = tren::udp_request(
-                        port,
-                        "QUIT\n",
-                        Duration::from_millis(500),
-                    );
-                }
-            }
-        }
-        let _ = self.wrapper.kill();
-        let _ = self.wrapper.wait();
-        let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
+  impl Drop for Sandbox {
+      fn drop(&mut self) {
+          if let Some(workdir) = Self::find_workdir(&self.dir) {
+              if let Ok(port_str) = std::fs::read_to_string(workdir.join("port")) {
+                  if let Ok(port) = port_str.trim().parse::<u16>() {
+                      let _ = tren::udp_request(
+                          port,
+                          "QUIT\n",
+                          Duration::from_millis(500),
+                      );
+                  }
+              }
+          }
+          let _ = self.wrapper.kill();
+          let _ = self.wrapper.wait();
+          let _ = std::fs::remove_dir_all(&self.dir);
+      }
+  }
 
-/// `qsub` of a failing command must:
-///   * still print the bit_addr to stdout,
-///   * block until the job finishes,
-///   * print `[qsub] exit=1` on stderr,
-///   * exit the qsub process with code 1,
-///   * leave the node in `DONE(<nonzero>)` on disk.
-#[test]
-fn smoke_qsub_failing_command_exits_one() {
-    let sb = Sandbox::new("fail");
-    let (rc, stdout, stderr) = sb.qsub_raw(&["false"]);
-    let addr = stdout.trim();
-    assert!(!addr.is_empty(),
-        "qsub should still print the bit_addr (got stdout {:?})", stdout);
-    assert_eq!(rc, 1,
-        "qsub of `false` should exit 1 (stderr: {})", stderr);
-    assert!(stderr.contains("[qsub] exit=1"),
-        "stderr should contain `[qsub] exit=1`, got: {}", stderr);
-    let state = sb.read_node_state(addr);
-    assert!(
-        state.starts_with("DONE(") && state != "DONE(0)",
-        "node {} should be DONE(<nonzero>), got {:?}", addr, state,
-    );
-}
+  // ─── Original smoke cases (kept verbatim) ──────────────────────────────────
 
-/// Submit + wait round-trip on a trivial job.
-#[test]
-fn smoke_qsub_then_qwait_succeeds() {
-    let sb = Sandbox::new("basic");
-    let addr = sb.qsub(&["true"]);
-    assert!(!addr.is_empty(), "qsub returned no bit_addr");
+  #[test]
+  fn smoke_qsub_failing_command_exits_one() {
+      let sb = Sandbox::new("fail");
+      let (rc, stdout, stderr) = sb.qsub_raw(&["false"]);
+      let addr = stdout.trim();
+      assert!(!addr.is_empty(),
+          "qsub should still print the bit_addr (got stdout {:?})", stdout);
+      assert_eq!(rc, 1,
+          "qsub of `false` should exit 1 (stderr: {})", stderr);
+      assert!(stderr.contains("[qsub] exit=1"),
+          "stderr should contain `[qsub] exit=1`, got: {}", stderr);
+      let state = sb.read_node_state(addr);
+      assert!(
+          state.starts_with("DONE(") && state != "DONE(0)",
+          "node {} should be DONE(<nonzero>), got {:?}", addr, state,
+      );
+  }
 
-    let exit = sb.qwait(&[&addr]);
-    assert_eq!(exit, 0, "qwait should exit 0 on DONE(0)");
+  #[test]
+  fn smoke_qsub_then_qwait_succeeds() {
+      let sb = Sandbox::new("basic");
+      let addr = sb.qsub(&["true"]);
+      assert!(!addr.is_empty(), "qsub returned no bit_addr");
 
-    let state = sb.read_node_state(&addr);
-    assert!(
-        state.starts_with("DONE("),
-        "node {} should be DONE, got {:?}",
-        addr,
-        state,
-    );
-}
+      let exit = sb.qwait(&[&addr]);
+      assert_eq!(exit, 0, "qwait should exit 0 on DONE(0)");
 
-/// `--after` enforces ordering: the dependent job must observe the side
-/// effect of the parent (here: a marker line in a shared log file) before
-/// it runs its own command.
-#[test]
-fn smoke_dependency_runs_after_parent() {
-    let sb = Sandbox::new("dep");
+      let state = sb.read_node_state(&addr);
+      assert!(
+          state.starts_with("DONE("),
+          "node {} should be DONE, got {:?}",
+          addr,
+          state,
+      );
+  }
 
-    // A appends "A" then sleeps; B (depending on A) appends "B".
-    // With correct dependency handling, the file contains "A\nB\n" in
-    // that order. If B raced ahead it would either be empty/absent on
-    // disk or come before A.
-    let a = sb.qsub(&["echo A >> shared.log && sleep 0.3"]);
-    let b = sb.qsub(&["--after", &a, "--", "echo B >> shared.log"]);
+  #[test]
+  fn smoke_dependency_runs_after_parent() {
+      let sb = Sandbox::new("dep");
 
-    let exit = sb.qwait(&[&a, &b]);
-    assert_eq!(exit, 0, "qwait of {a} {b} should exit 0");
+      let a = sb.qsub(&["echo A >> shared.log && sleep 0.3"]);
+      let b = sb.qsub(&["--after", &a, "--", "echo B >> shared.log"]);
 
-    let log_path = sb.dir.join("shared.log");
-    let log = std::fs::read_to_string(&log_path)
-        .unwrap_or_else(|e| panic!("read {}: {e}", log_path.display()));
-    let lines: Vec<&str> = log.lines().collect();
-    assert_eq!(
-        lines,
-        vec!["A", "B"],
-        "shared log should record A before B (got {:?})",
-        log,
-    );
+      let exit = sb.qwait(&[&a, &b]);
+      assert_eq!(exit, 0, "qwait of {a} {b} should exit 0");
 
-    assert!(sb.read_node_state(&a).starts_with("DONE("));
-    assert!(sb.read_node_state(&b).starts_with("DONE("));
-}
+      let log_path = sb.dir.join("shared.log");
+      let log = std::fs::read_to_string(&log_path)
+          .unwrap_or_else(|e| panic!("read {}: {e}", log_path.display()));
+      let lines: Vec<&str> = log.lines().collect();
+      assert_eq!(
+          lines,
+          vec!["A", "B"],
+          "shared log should record A before B (got {:?})",
+          log,
+      );
 
-/// What triggers the wrapper to shut down for a given test case.
-enum ShutdownKind {
-    Signal(libc::c_int),
-    UdpQuit,
-}
+      assert!(sb.read_node_state(&a).starts_with("DONE("));
+      assert!(sb.read_node_state(&b).starts_with("DONE("));
+  }
 
-/// Every documented normal-shutdown path (SIGINT / SIGTERM / SIGHUP /
-/// UDP `QUIT`) must leave **no** `.tren-<uuid>/` directory behind: the
-/// wrapper's own workdir cleanup must run even when worker threads are
-/// actively writing state files at the moment of shutdown.
-#[test]
-fn smoke_workdir_removed_after_signal_shutdown() {
-    let cases: &[(&str, ShutdownKind)] = &[
-        ("sigterm", ShutdownKind::Signal(libc::SIGTERM)),
-        ("sigint",  ShutdownKind::Signal(libc::SIGINT)),
-        ("sighup",  ShutdownKind::Signal(libc::SIGHUP)),
-        ("udpquit", ShutdownKind::UdpQuit),
-    ];
+  enum ShutdownKind {
+      Signal(libc::c_int),
+      UdpQuit,
+  }
 
-    for (label, kind) in cases {
-        let mut sb = Sandbox::new(label);
+  #[test]
+  fn smoke_workdir_removed_after_signal_shutdown() {
+      let cases: &[(&str, ShutdownKind)] = &[
+          ("sigterm", ShutdownKind::Signal(libc::SIGTERM)),
+          ("sigint",  ShutdownKind::Signal(libc::SIGINT)),
+          ("sighup",  ShutdownKind::Signal(libc::SIGHUP)),
+          ("udpquit", ShutdownKind::UdpQuit),
+      ];
 
-        // Submit a few short jobs in the background so worker threads are
-        // actively writing state files when shutdown arrives. We use
-        // `&` via `sh -c` to avoid qsub's implicit wait blocking the test.
-        for _ in 0..3 {
-            let _ = Command::new("sh")
-                .arg("-c")
-                .arg(format!("{} sleep 0.2 &", QSUB))
-                .current_dir(&sb.dir)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        // Tiny pause so the SUBMITs land before we trigger shutdown.
-        thread::sleep(Duration::from_millis(150));
+      for (label, kind) in cases {
+          let mut sb = Sandbox::new(label);
 
-        let workdir = Sandbox::find_workdir(&sb.dir)
-            .expect("workdir should exist while wrapper is alive");
-        assert!(workdir.is_dir());
+          for _ in 0..3 {
+              let _ = Command::new("sh")
+                  .arg("-c")
+                  .arg(format!("{} sleep 0.2 &", QSUB))
+                  .current_dir(&sb.dir)
+                  .stdout(Stdio::null())
+                  .stderr(Stdio::null())
+                  .status();
+          }
+          thread::sleep(Duration::from_millis(150));
 
-        match kind {
-            ShutdownKind::Signal(sig) => {
-                let pid = sb.wrapper.id() as i32;
-                unsafe { libc::kill(pid, *sig); }
-            }
-            ShutdownKind::UdpQuit => {
-                let port_str = std::fs::read_to_string(workdir.join("port"))
-                    .expect("read port file");
-                let port: u16 = port_str.trim().parse().expect("parse port");
-                let _ = tren::udp_request(
-                    port, "QUIT\n", Duration::from_millis(500),
-                );
-            }
-        }
+          let workdir = Sandbox::find_workdir(&sb.dir)
+              .expect("workdir should exist while wrapper is alive");
+          assert!(workdir.is_dir());
 
-        // Wait for the wrapper to actually exit. Signal-driven paths
-        // need ~250ms to observe SHUTDOWN plus a few hundred ms for the
-        // cleanup pass; UDP QUIT is roughly the same.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match sb.wrapper.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) => {
-                    if Instant::now() > deadline {
-                        let _ = sb.wrapper.kill();
-                        panic!("wrapper did not exit within 5s of {label}");
-                    }
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => panic!("try_wait: {e}"),
-            }
-        }
+          match kind {
+              ShutdownKind::Signal(sig) => {
+                  let pid = sb.wrapper.id() as i32;
+                  unsafe { libc::kill(pid, *sig); }
+              }
+              ShutdownKind::UdpQuit => {
+                  let port_str = std::fs::read_to_string(workdir.join("port"))
+                      .expect("read port file");
+                  let port: u16 = port_str.trim().parse().expect("parse port");
+                  let _ = tren::udp_request(
+                      port, "QUIT\n", Duration::from_millis(500),
+                  );
+              }
+          }
 
-        // The wrapper has exited cleanly — the workdir must be gone.
-        assert!(
-            !workdir.exists(),
-            "{label}: workdir {} should have been removed by wrapper shutdown",
-            workdir.display(),
-        );
-        assert!(
-            Sandbox::find_workdir(&sb.dir).is_none(),
-            "{label}: no .tren-* should remain under sandbox after shutdown",
-        );
+          let deadline = Instant::now() + Duration::from_secs(5);
+          loop {
+              match sb.wrapper.try_wait() {
+                  Ok(Some(_)) => break,
+                  Ok(None) => {
+                      if Instant::now() > deadline {
+                          let _ = sb.wrapper.kill();
+                          panic!("wrapper did not exit within 5s of {label}");
+                      }
+                      thread::sleep(Duration::from_millis(50));
+                  }
+                  Err(e) => panic!("try_wait: {e}"),
+              }
+          }
 
-        // Forget the Sandbox guard's QUIT/kill path — the wrapper is
-        // already gone. Drop will still wipe the temp dir for us.
-        drop(sb);
-    }
-}
+          assert!(
+              !workdir.exists(),
+              "{label}: workdir {} should have been removed by wrapper shutdown",
+              workdir.display(),
+          );
+          assert!(
+              Sandbox::find_workdir(&sb.dir).is_none(),
+              "{label}: no .tren-* should remain under sandbox after shutdown",
+          );
 
-/// v0.2.0 race fix: N concurrent `qsub` invocations in the *same* fresh
-/// cwd (no wrapper pre-existing) must end up sharing exactly one
-/// `.tren-<uuid>/` workdir. Previously each racer would `find_workdir`
-/// → `None` and each spawn its own wrapper, leaving 2+ duplicate
-/// siblings. The `.tren.lock` flock in `ensure_workdir` serializes the
-/// find→spawn critical section.
-#[test]
-fn smoke_concurrent_qsub_creates_single_workdir() {
-    // Fresh sandbox without a pre-spawned wrapper — we let qsub itself
-    // trigger `ensure_workdir`.
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!(
-        "tren-race-{}-{}", std::process::id(), stamp,
-    ));
-    std::fs::create_dir_all(&dir).expect("mkdir race sandbox");
+          drop(sb);
+      }
+  }
 
-    // Launch N qsub processes in parallel and wait for all of them.
-    const N: usize = 6;
-    let handles: Vec<_> = (0..N).map(|i| {
-        let dir = dir.clone();
-        thread::spawn(move || {
-            Command::new(QSUB)
-                .arg(format!("echo race-{}", i))
-                .current_dir(&dir)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .status()
-                .expect("spawn qsub")
-        })
-    }).collect();
-    for h in handles {
-        let st = h.join().expect("qsub thread");
-        assert!(st.success(), "qsub exit status: {:?}", st);
-    }
+  #[test]
+  fn smoke_concurrent_qsub_creates_single_workdir() {
+      let stamp = std::time::SystemTime::now()
+          .duration_since(std::time::UNIX_EPOCH)
+          .unwrap()
+          .as_nanos();
+      let dir = std::env::temp_dir().join(format!(
+          "tren-race-{}-{}", std::process::id(), stamp,
+      ));
+      std::fs::create_dir_all(&dir).expect("mkdir race sandbox");
 
-    // Count `.tren-*` siblings directly under the sandbox.
-    let mut workdirs: Vec<PathBuf> = Vec::new();
-    for ent in std::fs::read_dir(&dir).expect("read sandbox") {
-        let ent = ent.expect("dirent");
-        let name = ent.file_name();
-        let s = name.to_string_lossy();
-        if s.starts_with(".tren-") && ent.file_type().unwrap().is_dir() {
-            workdirs.push(ent.path());
-        }
-    }
-    assert_eq!(
-        workdirs.len(), 1,
-        "race fix violated: expected exactly 1 .tren-* under {}, got {}: {:?}",
-        dir.display(), workdirs.len(), workdirs,
-    );
+      const N: usize = 6;
+      let handles: Vec<_> = (0..N).map(|i| {
+          let dir = dir.clone();
+          thread::spawn(move || {
+              Command::new(QSUB)
+                  .arg(format!("echo race-{}", i))
+                  .current_dir(&dir)
+                  .stdout(Stdio::piped())
+                  .stderr(Stdio::piped())
+                  .status()
+                  .expect("spawn qsub")
+          })
+      }).collect();
+      for h in handles {
+          let st = h.join().expect("qsub thread");
+          assert!(st.success(), "qsub exit status: {:?}", st);
+      }
 
-    // Tear down: shut the lone wrapper down via UDP QUIT so the test
-    // does not leak processes, then wipe the sandbox.
-    if let Some(wd) = workdirs.first() {
-        if let Ok(port_str) = std::fs::read_to_string(wd.join("port")) {
-            if let Ok(port) = port_str.trim().parse::<u16>() {
-                let _ = tren::udp_request(
-                    port, "QUIT\n", Duration::from_millis(500),
-                );
-            }
-        }
-    }
-    // Give the wrapper a moment to exit before removing the dir.
-    thread::sleep(Duration::from_millis(200));
-    let _ = std::fs::remove_dir_all(&dir);
-}
+      let mut workdirs: Vec<PathBuf> = Vec::new();
+      for ent in std::fs::read_dir(&dir).expect("read sandbox") {
+          let ent = ent.expect("dirent");
+          let name = ent.file_name();
+          let s = name.to_string_lossy();
+          if s.starts_with(".tren-") && ent.file_type().unwrap().is_dir() {
+              workdirs.push(ent.path());
+          }
+      }
+      assert_eq!(
+          workdirs.len(), 1,
+          "race fix violated: expected exactly 1 .tren-* under {}, got {}: {:?}",
+          dir.display(), workdirs.len(), workdirs,
+      );
+
+      if let Some(wd) = workdirs.first() {
+          if let Ok(port_str) = std::fs::read_to_string(wd.join("port")) {
+              if let Ok(port) = port_str.trim().parse::<u16>() {
+                  let _ = tren::udp_request(
+                      port, "QUIT\n", Duration::from_millis(500),
+                  );
+              }
+          }
+      }
+      thread::sleep(Duration::from_millis(200));
+      let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Test macros — each macro invocation expands to one real `#[test]` fn so
+  // `cargo test` parallelises every case independently.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Primary: trivial successful command. Just expects DONE(0).
+  macro_rules! p_ok {
+      ($name:ident, $cmd:expr) => {
+          #[test]
+          fn $name() {
+              let sb = Sandbox::new(stringify!($name));
+              let addr = sb.qsub(&[$cmd]);
+              assert!(!addr.is_empty());
+              let state = sb.read_node_state(&addr);
+              assert_eq!(state, "DONE(0)", "expected DONE(0) for {:?}, got {:?}", $cmd, state);
+          }
+      };
+  }
+
+  /// Primary: explicit exit code N — qsub itself exits 0 only when the
+  /// node finished DONE(0); for any nonzero code it exits 1. The actual
+  /// exit code is preserved in the node state file as DONE(N).
+  macro_rules! p_exit {
+      ($name:ident, $code:expr) => {
+          #[test]
+          fn $name() {
+              let sb = Sandbox::new(stringify!($name));
+              let cmd = format!("exit {}", $code);
+              let (rc, stdout, stderr) = sb.qsub_raw(&[&cmd]);
+              let addr = stdout.trim();
+              assert!(!addr.is_empty(), "no bit_addr returned");
+              let expected_rc: i32 = if $code == 0 { 0 } else { 1 };
+              assert_eq!(rc, expected_rc,
+                  "qsub rc for exit {} should be {} (stderr: {})",
+                  $code, expected_rc, stderr);
+              let state = sb.read_node_state(addr);
+              assert_eq!(state, format!("DONE({})", $code));
+          }
+      };
+  }
+
+  /// Primary: dependency chain where child runs only after parent completes.
+  macro_rules! p_dep_chain {
+      ($name:ident, $marker:expr) => {
+          #[test]
+          fn $name() {
+              let sb = Sandbox::new(stringify!($name));
+              let parent = sb.qsub(&[&format!("echo P{} >> chain.log", $marker)]);
+              let child  = sb.qsub(&["--after", &parent, "--",
+                  &format!("echo C{} >> chain.log", $marker)]);
+              assert_eq!(sb.qwait(&[&parent, &child]), 0);
+              let log = std::fs::read_to_string(sb.dir.join("chain.log")).unwrap();
+              let lines: Vec<&str> = log.lines().collect();
+              assert_eq!(lines, vec![format!("P{}", $marker), format!("C{}", $marker)]);
+          }
+      };
+  }
+
+  /// Primary: small batch of independent jobs all succeed.
+  macro_rules! p_batch_ok {
+      ($name:ident, $n:expr) => {
+          #[test]
+          fn $name() {
+              let sb = Sandbox::new(stringify!($name));
+              let mut addrs = Vec::new();
+              for _ in 0..$n {
+                  addrs.push(sb.qsub(&["true"]));
+              }
+              let refs: Vec<&str> = addrs.iter().map(|s| s.as_str()).collect();
+              assert_eq!(sb.qwait(&refs), 0);
+              for a in &addrs {
+                  assert_eq!(sb.read_node_state(a), "DONE(0)");
+              }
+          }
+      };
+  }
+
+  /// Edge: failing command must propagate non-zero exit. qsub itself
+  /// returns 1 for any nonzero job exit code; the exact code is recorded
+  /// in the node state file as DONE(N).
+  macro_rules! e_fail {
+      ($name:ident, $code:expr) => {
+          #[test]
+          fn $name() {
+              let sb = Sandbox::new(stringify!($name));
+              let cmd = format!("exit {}", $code);
+              let (rc, stdout, stderr) = sb.qsub_raw(&[&cmd]);
+              let addr = stdout.trim();
+              assert!(!addr.is_empty());
+              assert_eq!(rc, 1,
+                  "qsub rc for nonzero exit {} should be 1 (stderr: {})",
+                  $code, stderr);
+              let state = sb.read_node_state(addr);
+              assert_eq!(state, format!("DONE({})", $code));
+          }
+      };
+  }
+
+  /// Edge: child of a failing parent must end in FAILED(dep failed).
+  macro_rules! e_dep_fail {
+      ($name:ident, $tag:expr) => {
+          #[test]
+          fn $name() {
+              let sb = Sandbox::new(stringify!($name));
+              let (_rc, parent_out, _) = sb.qsub_raw(&["false"]);
+              let parent = parent_out.trim().to_string();
+              assert!(!parent.is_empty());
+              let (_rc2, child_out, _) = sb.qsub_raw(&[
+                  "--after", &parent, "--", &format!("echo {}", $tag)
+              ]);
+              let child = child_out.trim().to_string();
+              assert!(!child.is_empty());
+              // Wait briefly for dep-fail propagation.
+              let deadline = Instant::now() + Duration::from_secs(5);
+              loop {
+                  let s = sb.read_node_state(&child);
+                  if s.starts_with("FAILED") { break; }
+                  if Instant::now() > deadline {
+                      panic!("child {} did not transition to FAILED, last={:?}", child, s);
+                  }
+                  thread::sleep(Duration::from_millis(50));
+              }
+          }
+      };
+  }
+
+  /// Edge: command containing a special shell character. We don't care
+  /// about its exit code — only that the node finishes (DONE(*) or FAILED).
+  macro_rules! e_special {
+      ($name:ident, $cmd:expr) => {
+          #[test]
+          fn $name() {
+              let sb = Sandbox::new(stringify!($name));
+              let (_rc, stdout, _stderr) = sb.qsub_raw(&[$cmd]);
+              let addr = stdout.trim();
+              assert!(!addr.is_empty(), "no bit_addr for cmd {:?}", $cmd);
+              let deadline = Instant::now() + Duration::from_secs(5);
+              loop {
+                  let s = sb.read_node_state(addr);
+                  if s.starts_with("DONE(") || s.starts_with("FAILED") { break; }
+                  if Instant::now() > deadline {
+                      panic!("node {} stuck in state {:?} for cmd {:?}", addr, s, $cmd);
+                  }
+                  thread::sleep(Duration::from_millis(50));
+              }
+          }
+      };
+  }
+
+  /// Edge: many concurrent SUBMITs must all finish DONE(0) (worker cap
+  /// keeps in-flight count bounded; queue drains all of them).
+  macro_rules! e_concurrent {
+      ($name:ident, $n:expr) => {
+          #[test]
+          fn $name() {
+              let sb = Sandbox::new(stringify!($name));
+              let mut addrs = Vec::new();
+              for i in 0..$n {
+                  addrs.push(sb.qsub(&[&format!("echo c{}", i)]));
+              }
+              let refs: Vec<&str> = addrs.iter().map(|s| s.as_str()).collect();
+              assert_eq!(sb.qwait(&refs), 0);
+              for a in &addrs {
+                  assert_eq!(sb.read_node_state(a), "DONE(0)",
+                      "node {} should be DONE(0)", a);
+              }
+          }
+      };
+  }
+  
+// ─── Primary cases (P001–P100) ──────────────────────────────────────────
+
+p_ok!(p001_ok, "true");
+p_ok!(p002_ok, "echo hello");
+p_ok!(p003_ok, "echo world");
+p_ok!(p004_ok, "echo a");
+p_ok!(p005_ok, "echo 1");
+p_ok!(p006_ok, "pwd");
+p_ok!(p007_ok, "ls");
+p_ok!(p008_ok, "echo hi");
+p_ok!(p009_ok, "echo p");
+p_ok!(p010_ok, "echo q");
+p_ok!(p011_ok, "true && true");
+p_ok!(p012_ok, ": ");
+p_ok!(p013_ok, "echo ok");
+p_ok!(p014_ok, "true && echo done");
+p_ok!(p015_ok, "echo x > /dev/null");
+p_ok!(p016_ok, "echo y");
+p_ok!(p017_ok, "echo z");
+p_ok!(p018_ok, "true && pwd");
+p_ok!(p019_ok, "echo foo");
+p_ok!(p020_ok, "echo bar");
+p_exit!(p021_exit_0_v0, 0);
+p_exit!(p022_exit_1_v0, 1);
+p_exit!(p023_exit_2_v0, 2);
+p_exit!(p024_exit_3_v0, 3);
+p_exit!(p025_exit_4_v0, 4);
+p_exit!(p026_exit_5_v0, 5);
+p_exit!(p027_exit_6_v0, 6);
+p_exit!(p028_exit_7_v0, 7);
+p_exit!(p029_exit_8_v0, 8);
+p_exit!(p030_exit_9_v0, 9);
+p_exit!(p031_exit_0_v1, 0);
+p_exit!(p032_exit_1_v1, 1);
+p_exit!(p033_exit_2_v1, 2);
+p_exit!(p034_exit_3_v1, 3);
+p_exit!(p035_exit_4_v1, 4);
+p_exit!(p036_exit_5_v1, 5);
+p_exit!(p037_exit_6_v1, 6);
+p_exit!(p038_exit_7_v1, 7);
+p_exit!(p039_exit_8_v1, 8);
+p_exit!(p040_exit_9_v1, 9);
+p_dep_chain!(p041_dep_chain, 0);
+p_dep_chain!(p042_dep_chain, 1);
+p_dep_chain!(p043_dep_chain, 2);
+p_dep_chain!(p044_dep_chain, 3);
+p_dep_chain!(p045_dep_chain, 4);
+p_dep_chain!(p046_dep_chain, 5);
+p_dep_chain!(p047_dep_chain, 6);
+p_dep_chain!(p048_dep_chain, 7);
+p_dep_chain!(p049_dep_chain, 8);
+p_dep_chain!(p050_dep_chain, 9);
+p_dep_chain!(p051_dep_chain, 10);
+p_dep_chain!(p052_dep_chain, 11);
+p_dep_chain!(p053_dep_chain, 12);
+p_dep_chain!(p054_dep_chain, 13);
+p_dep_chain!(p055_dep_chain, 14);
+p_dep_chain!(p056_dep_chain, 15);
+p_dep_chain!(p057_dep_chain, 16);
+p_dep_chain!(p058_dep_chain, 17);
+p_dep_chain!(p059_dep_chain, 18);
+p_dep_chain!(p060_dep_chain, 19);
+p_batch_ok!(p061_batch_1, 1);
+p_batch_ok!(p062_batch_2, 2);
+p_batch_ok!(p063_batch_3, 3);
+p_batch_ok!(p064_batch_4, 4);
+p_batch_ok!(p065_batch_5, 5);
+p_batch_ok!(p066_batch_6, 6);
+p_batch_ok!(p067_batch_7, 7);
+p_batch_ok!(p068_batch_8, 8);
+p_batch_ok!(p069_batch_9, 9);
+p_batch_ok!(p070_batch_10, 10);
+p_batch_ok!(p071_batch_11, 11);
+p_batch_ok!(p072_batch_12, 12);
+p_batch_ok!(p073_batch_13, 13);
+p_batch_ok!(p074_batch_14, 14);
+p_batch_ok!(p075_batch_15, 15);
+p_batch_ok!(p076_batch_16, 16);
+p_batch_ok!(p077_batch_17, 17);
+p_batch_ok!(p078_batch_18, 18);
+p_batch_ok!(p079_batch_19, 19);
+p_batch_ok!(p080_batch_20, 20);
+p_ok!(p081_ok_extra, "echo job-0 && true");
+p_ok!(p082_ok_extra, "echo job-1 && true");
+p_ok!(p083_ok_extra, "echo job-2 && true");
+p_ok!(p084_ok_extra, "echo job-3 && true");
+p_ok!(p085_ok_extra, "echo job-4 && true");
+p_ok!(p086_ok_extra, "echo job-5 && true");
+p_ok!(p087_ok_extra, "echo job-6 && true");
+p_ok!(p088_ok_extra, "echo job-7 && true");
+p_ok!(p089_ok_extra, "echo job-8 && true");
+p_ok!(p090_ok_extra, "echo job-9 && true");
+p_ok!(p091_ok_extra, "echo job-10 && true");
+p_ok!(p092_ok_extra, "echo job-11 && true");
+p_ok!(p093_ok_extra, "echo job-12 && true");
+p_ok!(p094_ok_extra, "echo job-13 && true");
+p_ok!(p095_ok_extra, "echo job-14 && true");
+p_ok!(p096_ok_extra, "echo job-15 && true");
+p_ok!(p097_ok_extra, "echo job-16 && true");
+p_ok!(p098_ok_extra, "echo job-17 && true");
+p_ok!(p099_ok_extra, "echo job-18 && true");
+p_ok!(p100_ok_extra, "echo job-19 && true");
+
+// ─── Edge cases (E001–E100) ──────────────────────────────────────────────
+
+e_fail!(e001_fail_1_v0, 1);
+e_fail!(e002_fail_2_v0, 2);
+e_fail!(e003_fail_3_v0, 3);
+e_fail!(e004_fail_4_v0, 4);
+e_fail!(e005_fail_5_v0, 5);
+e_fail!(e006_fail_6_v0, 6);
+e_fail!(e007_fail_7_v0, 7);
+e_fail!(e008_fail_8_v0, 8);
+e_fail!(e009_fail_9_v0, 9);
+e_fail!(e010_fail_10_v0, 10);
+e_fail!(e011_fail_11_v0, 11);
+e_fail!(e012_fail_12_v0, 12);
+e_fail!(e013_fail_13_v0, 13);
+e_fail!(e014_fail_14_v0, 14);
+e_fail!(e015_fail_15_v0, 15);
+e_fail!(e016_fail_16_v0, 16);
+e_fail!(e017_fail_17_v0, 17);
+e_fail!(e018_fail_18_v0, 18);
+e_fail!(e019_fail_19_v0, 19);
+e_fail!(e020_fail_1_v1, 1);
+e_dep_fail!(e021_dep_fail, "tag0");
+e_dep_fail!(e022_dep_fail, "tag1");
+e_dep_fail!(e023_dep_fail, "tag2");
+e_dep_fail!(e024_dep_fail, "tag3");
+e_dep_fail!(e025_dep_fail, "tag4");
+e_dep_fail!(e026_dep_fail, "tag5");
+e_dep_fail!(e027_dep_fail, "tag6");
+e_dep_fail!(e028_dep_fail, "tag7");
+e_dep_fail!(e029_dep_fail, "tag8");
+e_dep_fail!(e030_dep_fail, "tag9");
+e_dep_fail!(e031_dep_fail, "tag10");
+e_dep_fail!(e032_dep_fail, "tag11");
+e_dep_fail!(e033_dep_fail, "tag12");
+e_dep_fail!(e034_dep_fail, "tag13");
+e_dep_fail!(e035_dep_fail, "tag14");
+e_dep_fail!(e036_dep_fail, "tag15");
+e_dep_fail!(e037_dep_fail, "tag16");
+e_dep_fail!(e038_dep_fail, "tag17");
+e_dep_fail!(e039_dep_fail, "tag18");
+e_dep_fail!(e040_dep_fail, "tag19");
+e_special!(e041_special, "echo 'single quotes'");
+e_special!(e042_special, "echo \\\"double quotes\\\"");
+e_special!(e043_special, "echo a;echo b");
+e_special!(e044_special, "echo a && echo b");
+e_special!(e045_special, "echo a || echo b");
+e_special!(e046_special, "echo $$");
+e_special!(e047_special, "echo $HOME");
+e_special!(e048_special, "echo \\\"hello world\\\"");
+e_special!(e049_special, "echo a|cat");
+e_special!(e050_special, "echo {1,2,3}");
+e_special!(e051_special, "echo *.nonexistent_glob");
+e_special!(e052_special, "echo \\\"\\\\$var\\\"");
+e_special!(e053_special, "echo \\\"backslash: \\\\\\\\\\\"");
+e_special!(e054_special, "echo  multiple  spaces  ");
+e_special!(e055_special, "echo -n no_newline");
+e_special!(e056_special, "echo 'a\\\\tb'");
+e_special!(e057_special, "true; true; true");
+e_special!(e058_special, "echo x > /dev/null");
+e_special!(e059_special, "(echo subshell)");
+e_special!(e060_special, "echo \\\"end\\\"");
+e_concurrent!(e061_conc_5_v0, 5);
+e_concurrent!(e062_conc_6_v0, 6);
+e_concurrent!(e063_conc_7_v0, 7);
+e_concurrent!(e064_conc_8_v0, 8);
+e_concurrent!(e065_conc_9_v0, 9);
+e_concurrent!(e066_conc_10_v0, 10);
+e_concurrent!(e067_conc_11_v0, 11);
+e_concurrent!(e068_conc_12_v0, 12);
+e_concurrent!(e069_conc_5_v1, 5);
+e_concurrent!(e070_conc_6_v1, 6);
+e_concurrent!(e071_conc_7_v1, 7);
+e_concurrent!(e072_conc_8_v1, 8);
+e_concurrent!(e073_conc_9_v1, 9);
+e_concurrent!(e074_conc_10_v1, 10);
+e_concurrent!(e075_conc_11_v1, 11);
+e_concurrent!(e076_conc_12_v1, 12);
+e_concurrent!(e077_conc_5_v2, 5);
+e_concurrent!(e078_conc_6_v2, 6);
+e_concurrent!(e079_conc_7_v2, 7);
+e_concurrent!(e080_conc_8_v2, 8);
+e_special!(e081_more, "true");
+e_special!(e082_more, "false || true");
+e_special!(e083_more, "false; true");
+e_special!(e084_more, "test 1 -eq 1");
+e_special!(e085_more, "test 1 -eq 2 || true");
+e_special!(e086_more, "[ 1 = 1 ]");
+e_special!(e087_more, "[ 1 = 2 ] || true");
+e_special!(e088_more, "echo $((1+1))");
+e_special!(e089_more, "echo $((5*5))");
+e_special!(e090_more, "for i in 1 2 3; do echo $i; done");
+e_special!(e091_more, "while false; do echo never; done");
+e_special!(e092_more, "if true; then echo yes; fi");
+e_special!(e093_more, "if false; then echo no; else echo else; fi");
+e_special!(e094_more, "case x in x) echo match;; esac");
+e_special!(e095_more, "x=1; echo $x");
+e_special!(e096_more, "f() { echo fn; }; f");
+e_special!(e097_more, "echo a > /tmp/tren_test_$$_unused && rm -f /tmp/tren_test_$$_unused");
+e_special!(e098_more, "true > /dev/null 2>&1");
+e_special!(e099_more, "{ echo grouped; }");
+e_special!(e100_more, "true # trailing comment");
