@@ -16,6 +16,11 @@
   crc32c = "0.6"
   rand   = { version = "0.8", optional = true }
 
+  [[example]]
+  name              = "exp_even_bit"
+  path              = "examples/exp_even_bit.rs"
+  required-features = ["experimental"]
+
   [[bin]]
   name = "tren-wrapper"
   path = "src/bin/tren_wrapper.rs"
