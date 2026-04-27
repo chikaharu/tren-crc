@@ -708,14 +708,14 @@ e_special!(e100_more, "true # trailing comment");
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn frame32_roundtrip_and_parity() {
+fn frame32_roundtrip_and_crc() {
     use tren::{build_submit, decode_submit, Frame32, OP_SUBMIT};
     let deps = vec![3u64, 5, 7, 11];
     let token = 0xDEAD_BEEF & 0x7FFF_FFFF;
     let f = build_submit(&deps, token, 0);
     assert_eq!(f.op(), OP_SUBMIT);
 
-    // Round-trip via bytes (also forces parity update + verify).
+    // Round-trip via bytes (also forces CRC update + verify).
     let bytes = f.to_bytes();
     assert_eq!(bytes.len(), 128);
     let g = Frame32::from_bytes(&bytes).expect("frame parses");
@@ -724,29 +724,29 @@ fn frame32_roundtrip_and_parity() {
     assert_eq!(got_deps, deps);
     assert_eq!(got_tok, token);
 
-    // Single-bit corruption MUST be detected by the diagonal parity check.
+    // Single-bit corruption MUST be detected by the diagonal CRC-32C check.
     let mut bad = bytes;
     bad[17] ^= 0x04; // flip one data bit deep in the frame
     assert!(matches!(
         Frame32::from_bytes(&bad),
-        Err(tren::FrameError::ParityMismatch)
-    ), "single-bit flip should fail parity verification");
+        Err(tren::FrameError::CrcMismatch)
+    ), "single-bit flip should fail CRC-32C verification");
 }
 
 #[test]
 fn frame32_data_slot_roundtrip_all_positions() {
-    // The "diagonal parity" bit in slot[i] is bit i. The set/get helpers
+    // The "diagonal CRC-32C" bit in slot[i] is bit i. The set/get helpers
     // must round-trip a 31-bit data value through every slot, never
-    // colliding with the parity bit.
+    // colliding with the diagonal CRC bit.
     use tren::Frame32;
     for slot in 0..32usize {
         let mut f = Frame32::new();
         // Use a different bit-pattern for each slot to catch off-by-one bugs.
         let value = (0x55AA_55AAu32 ^ (slot as u32 * 17)) & 0x7FFF_FFFF;
         f.set(slot, value);
-        f.update_parity();
+        f.update_crc();
         assert_eq!(f.get(slot), value, "slot {} round-trip mismatch", slot);
-        assert!(f.verify_parity(), "slot {} parity invalid", slot);
+        assert!(f.verify_crc(), "slot {} CRC invalid", slot);
     }
 }
 

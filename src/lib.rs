@@ -371,9 +371,19 @@ pub const STATE_DONE: u32    = 3;
 pub const STATE_FAILED: u32  = 4;
 
 /// Fixed 128-byte UDP frame: 32 × u32 slots laid out as a 32×32 bit
-/// matrix. Bit `i` of slot `i` (the diagonal) holds the **even XOR parity**
-/// of the other 31 bits in that slot, so a single-bit error in any row is
-/// detected by [`Frame32::verify_parity`].
+/// matrix. Bit `i` of slot `i` (the diagonal, 32 bits total) holds the
+/// **CRC-32C (Castagnoli, polynomial 0x1EDC6F41)** of the rest of the
+/// frame, computed Ethernet-FCS-style: the diagonal bits are zeroed,
+/// the 128-byte big-endian serialization is fed to CRC-32C, and the
+/// 32-bit result is scattered back so that bit `i` of the result lands
+/// in bit `i` of slot `i` (LSB-first).
+///
+/// This detects any 1, 2, or 3 random bit errors, any odd number of bit
+/// errors, and any burst error of length ≤ 32 bits anywhere in the
+/// frame — including burst errors that hit only the diagonal.
+///
+/// CRC-32C accelerates on x86 (`CRC32` instruction) and ARMv8
+/// (`CRC32CX` instruction); the [`crc32c`] crate auto-detects this.
 ///
 /// Wire format is big-endian per slot (network byte order).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -383,20 +393,20 @@ impl Frame32 {
     pub fn new() -> Self { Frame32([0u32; 32]) }
 
     /// Encode a 31-bit value into the data of slot `slot`, **leaving the
-    /// diagonal parity bit (bit `slot`) untouched**. Call
-    /// [`Self::update_parity`] before transmitting.
+    /// diagonal CRC bit (bit `slot`) untouched**. Call
+    /// [`Self::update_crc`] before transmitting.
     pub fn set(&mut self, slot: usize, value: u32) {
         debug_assert!(slot < 32);
         let v = value & 0x7FFF_FFFF;
         let lo_mask = if slot == 0 { 0 } else { (1u32 << slot) - 1 };
         let lo = v & lo_mask;
         let hi = if slot >= 31 { 0 } else { (v >> slot) << (slot + 1) };
-        let parity_keep = self.0[slot] & (1u32 << slot);
-        self.0[slot] = parity_keep | lo | hi;
+        let diagonal_keep = self.0[slot] & (1u32 << slot);
+        self.0[slot] = diagonal_keep | lo | hi;
     }
 
     /// Inverse of [`Self::set`] — recover the 31-bit data value of slot
-    /// `slot`, ignoring the diagonal parity bit.
+    /// `slot`, ignoring the diagonal CRC bit.
     pub fn get(&self, slot: usize) -> u32 {
         debug_assert!(slot < 32);
         let s = self.0[slot] & !(1u32 << slot);
@@ -406,21 +416,49 @@ impl Frame32 {
         (lo | hi) & 0x7FFF_FFFF
     }
 
-    /// Recompute and write the diagonal XOR parity bit of every slot so
-    /// every row's full 32-bit XOR is 0. Must be called immediately
+    /// Compute CRC-32C of the frame with the diagonal cleared, and
+    /// write the resulting 32 bits back into the diagonal (bit `i` of
+    /// the CRC into bit `i` of slot `i`). Must be called immediately
     /// before serialising for transmission.
-    pub fn update_parity(&mut self) {
+    pub fn update_crc(&mut self) {
+        // 1) Clear the diagonal so the input to CRC is deterministic
+        //    regardless of any stale diagonal bits in self.
         for i in 0..32 {
-            let val = self.0[i] & !(1u32 << i);
-            let p = (val.count_ones() & 1) as u32;
-            self.0[i] = val | (p << i);
+            self.0[i] &= !(1u32 << i);
+        }
+        // 2) Serialise to 128 big-endian bytes and CRC.
+        let mut buf = [0u8; 128];
+        for i in 0..32 {
+            buf[i*4..(i+1)*4].copy_from_slice(&self.0[i].to_be_bytes());
+        }
+        let crc = crc32c::crc32c(&buf);
+        // 3) Scatter CRC bit i into bit i of slot i.
+        for i in 0..32 {
+            if (crc >> i) & 1 == 1 {
+                self.0[i] |= 1u32 << i;
+            }
         }
     }
 
-    /// Verify that every row's full 32-bit XOR is 0. Returns `false` on
-    /// any single-bit error.
-    pub fn verify_parity(&self) -> bool {
-        (0..32).all(|i| (self.0[i].count_ones() & 1) == 0)
+    /// Recompute the diagonal CRC-32C from the data bits and compare
+    /// against the diagonal that was actually received. Returns `false`
+    /// on any detected corruption.
+    pub fn verify_crc(&self) -> bool {
+        // Extract the received diagonal as a single u32.
+        let mut received: u32 = 0;
+        for i in 0..32 {
+            if (self.0[i] >> i) & 1 == 1 {
+                received |= 1u32 << i;
+            }
+        }
+        // Recompute over a copy with the diagonal cleared.
+        let mut buf = [0u8; 128];
+        for i in 0..32 {
+            let cleared = self.0[i] & !(1u32 << i);
+            buf[i*4..(i+1)*4].copy_from_slice(&cleared.to_be_bytes());
+        }
+        let expected = crc32c::crc32c(&buf);
+        received == expected
     }
 
     /// Op code (high 8 bits of the slot-0 data field).
@@ -440,10 +478,11 @@ impl Frame32 {
     pub fn leaf_bitmap(&self, slot: usize) -> u32 { self.get(slot) }
     pub fn set_leaf_bitmap(&mut self, slot: usize, mask: u32) { self.set(slot, mask & 0x7FFF_FFFF); }
 
-    /// Serialise to 128 big-endian bytes. Refreshes parity first.
+    /// Serialise to 128 big-endian bytes. Refreshes the diagonal CRC
+    /// first.
     pub fn to_bytes(&self) -> [u8; 128] {
         let mut frame = *self;
-        frame.update_parity();
+        frame.update_crc();
         let mut out = [0u8; 128];
         for i in 0..32 {
             out[i*4..(i+1)*4].copy_from_slice(&frame.0[i].to_be_bytes());
@@ -452,14 +491,14 @@ impl Frame32 {
     }
 
     /// Deserialise from 128 big-endian bytes. Returns `Err` if length is
-    /// wrong or parity check fails.
+    /// wrong or the diagonal CRC-32C check fails.
     pub fn from_bytes(b: &[u8]) -> Result<Self, FrameError> {
         if b.len() != 128 { return Err(FrameError::WrongLength(b.len())); }
         let mut f = Frame32::new();
         for i in 0..32 {
             f.0[i] = u32::from_be_bytes([b[i*4], b[i*4+1], b[i*4+2], b[i*4+3]]);
         }
-        if !f.verify_parity() { return Err(FrameError::ParityMismatch); }
+        if !f.verify_crc() { return Err(FrameError::CrcMismatch); }
         Ok(f)
     }
 }
@@ -471,7 +510,7 @@ impl Default for Frame32 {
 #[derive(Debug)]
 pub enum FrameError {
     WrongLength(usize),
-    ParityMismatch,
+    CrcMismatch,
     Truncated,
     UnknownOp(u32),
     Io(io::Error),
@@ -481,7 +520,7 @@ impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::WrongLength(n)    => write!(f, "frame length {} != 128", n),
-            FrameError::ParityMismatch    => write!(f, "frame parity mismatch"),
+            FrameError::CrcMismatch       => write!(f, "frame CRC-32C mismatch"),
             FrameError::Truncated         => write!(f, "frame truncated"),
             FrameError::UnknownOp(o)      => write!(f, "unknown op {}", o),
             FrameError::Io(e)             => write!(f, "io: {}", e),
