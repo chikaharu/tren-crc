@@ -18,7 +18,7 @@
 //!   sibling wrapper for the next spill index and reply with a REDIRECT
 //!   frame pointing at its UDP port.
 
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::cmp::Ordering as CmpOrdering;
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
@@ -37,9 +37,21 @@ use tren::{
     OP_SUB, OP_SUBMIT, OP_UNSUB, SPILL_LEAF_CAP, SPILL_NODE_CAP,
     WORKDIR_PREFIX,
 };
+#[cfg(feature = "model")]
+use tren::priority::{encode_features, Features, Tree32};
 
 /// Maximum number of concurrently running nodes (resource constraint).
 const MAX_WORKERS: usize = 4;
+
+/// Default training-buffer capacity for the `feature = "model"` build.
+/// Override via env `TREN_MODEL_BUFFER`.
+#[cfg(feature = "model")]
+const DEFAULT_MODEL_BUFFER: usize = 256;
+
+/// Default re-train interval (number of new samples between rebuilds).
+/// Override via env `TREN_MODEL_RETRAIN_EVERY`.
+#[cfg(feature = "model")]
+const DEFAULT_RETRAIN_EVERY: usize = 32;
 
 type SubMap = Arc<Mutex<HashMap<SocketAddr, u32>>>; // value = filter_id (0 = wildcard)
 type ReadyQueue = Arc<Mutex<BinaryHeap<QueueItem>>>;
@@ -48,27 +60,77 @@ type RunningCount = Arc<Mutex<usize>>;
 /// time. 0 means "no spillover yet".
 type NextPort = Arc<AtomicU16>;
 
-#[derive(Debug)]
-struct NodeRecord {
-    deps:       Vec<String>,
-    pid:        Option<u32>,
-    state:      NodeState,
-    priority:   f64,
+/// Bookkeeping captured at SUBMIT time for label generation when the
+/// node finishes (used only when `feature = "model"` is on).
+#[cfg(feature = "model")]
+#[derive(Clone, Copy, Debug)]
+struct SubmitMeta {
+    features: u16,
 }
 
+#[cfg(feature = "model")]
+type ModelState = Arc<Mutex<ModelInner>>;
+#[cfg(feature = "model")]
+struct ModelInner {
+    tree:   Tree32,
+    buffer: VecDeque<(u16, bool)>,
+    /// Number of samples appended since last retrain.
+    new_since_train: usize,
+    /// Generation byte stamped into the Tree32 header on every retrain;
+    /// wraps modulo 256.
+    generation: u8,
+}
+
+#[derive(Debug)]
+struct NodeRecord {
+    deps:         Vec<String>,
+    pid:          Option<u32>,
+    state:        NodeState,
+    priority:     f64,
+    /// Number of nodes (including self) reachable from this node via
+    /// transitive descendants in the SUBMIT-declared DAG. Initialised
+    /// to 1 on SUBMIT and incremented for every new node that lists
+    /// this address in its transitive ancestors.
+    subtree_size: u64,
+    /// Depth in the DAG = max(parent depth) + 1. Used as a feature.
+    depth:        u32,
+    /// First byte of cmd.sh (cached as a feature). Read for the model
+    /// path; kept on the record for observability and future signals.
+    #[allow(dead_code)]
+    cmd_first_byte: u8,
+    /// Bookkeeping for the in-process model (only present under
+    /// `feature = "model"`).
+    #[cfg(feature = "model")]
+    meta:         Option<SubmitMeta>,
+}
+
+/// Queue ordering: bigger `subtree_size` first, then bigger `priority`,
+/// then lower `addr` (lexicographic) as a stable tiebreaker. Implemented
+/// against the standard `BinaryHeap` (max-heap) so larger-`Ord` items
+/// pop first.
 #[derive(Clone)]
 struct QueueItem {
-    priority: f64,
-    addr:     String,
+    subtree_size: u64,
+    priority:     f64,
+    addr:         String,
 }
 
 impl Eq for QueueItem {}
 impl PartialEq for QueueItem {
-    fn eq(&self, other: &Self) -> bool { self.priority == other.priority }
+    fn eq(&self, other: &Self) -> bool { self.cmp(other) == CmpOrdering::Equal }
 }
 impl Ord for QueueItem {
     fn cmp(&self, other: &Self) -> CmpOrdering {
-        self.priority.partial_cmp(&other.priority).unwrap_or(CmpOrdering::Equal)
+        match self.subtree_size.cmp(&other.subtree_size) {
+            CmpOrdering::Equal => {}
+            o                  => return o,
+        }
+        match self.priority.partial_cmp(&other.priority).unwrap_or(CmpOrdering::Equal) {
+            CmpOrdering::Equal => {}
+            o                  => return o,
+        }
+        // Lexicographically smaller addr should pop first → reverse.
+        other.addr.cmp(&self.addr)
     }
 }
 impl PartialOrd for QueueItem {
@@ -84,16 +146,52 @@ extern "C" fn handle_sig(_: libc::c_int) {
 }
 
 #[cfg(feature = "model")]
-fn call_model(cmd: &str, deps: &[String], addr: &str) -> Option<f64> {
-    use std::process::Command as Cmd;
-    let payload = format!(
-        r#"{{"cmd":"{}","deps":{:?},"addr":"{}"}}"#,
-        cmd.replace('"', "'"), deps, addr
-    );
-    let out = Cmd::new("tren-model").arg(payload).output().ok()?;
-    if !out.status.success() { return None; }
-    let s = String::from_utf8_lossy(&out.stdout);
-    s.trim().parse::<f64>().ok()
+fn model_buffer_capacity() -> usize {
+    std::env::var("TREN_MODEL_BUFFER")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MODEL_BUFFER)
+}
+
+#[cfg(feature = "model")]
+fn model_retrain_every() -> usize {
+    std::env::var("TREN_MODEL_RETRAIN_EVERY")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_RETRAIN_EVERY)
+}
+
+/// Walk transitive ancestors of `start_deps` (in the local spill's
+/// `tree`) and bump each ancestor's `subtree_size` by 1. Cycles are
+/// impossible (BFS allocation produces a DAG), but a `visited` set
+/// guards against shared parents being counted twice.
+fn bump_ancestor_subtree(tree: &Tree, start_deps: &[String]) {
+    if start_deps.is_empty() { return; }
+    let mut g = tree.lock().unwrap();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut q: VecDeque<String> = start_deps.iter().cloned().collect();
+    while let Some(addr) = q.pop_front() {
+        if !visited.insert(addr.clone()) { continue; }
+        if let Some(rec) = g.get_mut(&addr) {
+            rec.subtree_size = rec.subtree_size.saturating_add(1);
+            for d in rec.deps.clone() {
+                if !visited.contains(&d) { q.push_back(d); }
+            }
+        }
+    }
+}
+
+/// Compute the depth of a freshly submitted node = max(dep depth) + 1.
+fn compute_depth(tree: &Tree, deps: &[String]) -> u32 {
+    if deps.is_empty() { return 0; }
+    let g = tree.lock().unwrap();
+    let mut m = 0u32;
+    for d in deps {
+        if let Some(r) = g.get(d) { m = m.max(r.depth); }
+    }
+    m + 1
 }
 
 struct WorkdirGuard {
@@ -192,6 +290,13 @@ fn main() {
     let ready_queue: ReadyQueue   = Arc::new(Mutex::new(BinaryHeap::new()));
     let running:     RunningCount = Arc::new(Mutex::new(0usize));
     let next_port:   NextPort     = Arc::new(AtomicU16::new(0));
+    #[cfg(feature = "model")]
+    let model: ModelState = Arc::new(Mutex::new(ModelInner {
+        tree: Tree32::baseline(),
+        buffer: VecDeque::with_capacity(model_buffer_capacity()),
+        new_since_train: 0,
+        generation: 0,
+    }));
 
     {
         let tree = Arc::clone(&tree);
@@ -221,7 +326,9 @@ fn main() {
                 };
                 let reply = handle_request(
                     &frame, &cwd, &workdir, spill_seq, &tree, &subs,
-                    &ready_queue, &running, &next_port, src,
+                    &ready_queue, &running, &next_port,
+                    #[cfg(feature = "model")] &model,
+                    src,
                 );
                 if let Some(r) = reply {
                     let _ = socket.send_to(&r.to_bytes(), src);
@@ -258,6 +365,7 @@ fn handle_request(
     ready_queue: &ReadyQueue,
     running:     &RunningCount,
     next_port:   &NextPort,
+    #[cfg(feature = "model")] model: &ModelState,
     src:         SocketAddr,
 ) -> Option<Frame32> {
     match frame.op() {
@@ -281,7 +389,11 @@ fn handle_request(
                 .map(|&d| id_to_bit_addr(d))
                 .collect();
 
-            match allocate_node(workdir, tree, subs, ready_queue, running, deps_addrs, token) {
+            let alloc_result = allocate_node(
+                workdir, tree, subs, ready_queue, running, deps_addrs, token,
+                #[cfg(feature = "model")] model,
+            );
+            match alloc_result {
                 Ok(addr) => Some(build_ok(bit_addr_to_id(&addr).unwrap_or(0) as u32)),
                 Err(e)   => {
                     eprintln!("[tren-wrapper] allocate err: {}", e);
@@ -423,6 +535,7 @@ fn allocate_node(
     running:     &RunningCount,
     deps:        Vec<String>,
     token:       u32,
+    #[cfg(feature = "model")] model: &ModelState,
 ) -> Result<String, String> {
     let id   = next_seq(workdir);
     if id > SPILL_NODE_CAP {
@@ -432,11 +545,15 @@ fn allocate_node(
     let dir  = node_dir(workdir, &addr);
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {}", e))?;
 
-    // Move staged inbox file into the node directory as cmd.sh.
+    // Read cmd first byte from the staging file BEFORE the rename — used
+    // as a feature even when `model` is off (kept on the NodeRecord for
+    // observability and as a future signal source).
     let stage = inbox_path(workdir, token);
     if !stage.exists() {
         return Err(format!("inbox file missing for token {:08x}", token));
     }
+    let cmd_first_byte = first_nonws_byte(&stage).unwrap_or(0);
+
     let dst = dir.join("cmd.sh");
     fs::rename(&stage, &dst).map_err(|e| format!("rename inbox: {}", e))?;
 
@@ -446,17 +563,44 @@ fn allocate_node(
 
     let initial = if deps.is_empty() { NodeState::Pending } else { NodeState::Waiting };
 
-    #[allow(unused_mut)]
-    let mut priority = 0.0f64;
+    // Bump transitive-ancestor subtree_size counters BEFORE inserting
+    // the new node so the new node itself doesn't count itself.
+    bump_ancestor_subtree(tree, &deps);
+
+    let depth = compute_depth(tree, &deps);
+
+    #[cfg(not(feature = "model"))]
+    let priority = 0.0f64;
+
     #[cfg(feature = "model")]
-    {
-        // Read cmd from disk for the model since SUBMIT no longer carries it.
-        if let Ok(cmd) = fs::read_to_string(&dst) {
-            if let Some(p) = call_model(&cmd, &deps, &addr) {
-                priority = p;
+    let (priority, features_u16): (f64, u16) = {
+        // Estimate subtree size at this moment as max(dep.subtree_size).
+        // (The new node's own subtree is unknown at SUBMIT — the
+        // dep-side counter is the best static proxy for "is this on a
+        // long chain".)
+        let est_subtree = {
+            let g = tree.lock().unwrap();
+            let mut m = 1u32;
+            for d in &deps {
+                if let Some(r) = g.get(d) {
+                    m = m.max(r.subtree_size.min(u32::MAX as u64) as u32);
+                }
             }
-        }
-    }
+            m
+        };
+        let f = Features {
+            dep_count: deps.len().min(255) as u8,
+            subtree_size: est_subtree,
+            depth: depth.min(255) as u8,
+            cmd_first_byte,
+        };
+        let feats = encode_features(f);
+        let pred = {
+            let m = model.lock().unwrap();
+            m.tree.infer(feats)
+        };
+        (pred as f64, feats)
+    };
 
     {
         let mut g = tree.lock().unwrap();
@@ -465,6 +609,11 @@ fn allocate_node(
             pid:   None,
             state: initial.clone(),
             priority,
+            subtree_size: 1,
+            depth,
+            cmd_first_byte,
+            #[cfg(feature = "model")]
+            meta: Some(SubmitMeta { features: features_u16 }),
         });
     }
     publish_state(workdir, &addr, &initial, subs);
@@ -475,9 +624,28 @@ fn allocate_node(
     let queue_t      = Arc::clone(ready_queue);
     let running_t    = Arc::clone(running);
     let addr_t       = addr.clone();
-    thread::spawn(move || run_node(workdir_t, tree_t, subs_t, queue_t, running_t, addr_t));
+    #[cfg(feature = "model")]
+    let model_t      = Arc::clone(model);
+    thread::spawn(move || run_node(
+        workdir_t, tree_t, subs_t, queue_t, running_t, addr_t,
+        #[cfg(feature = "model")] model_t,
+    ));
 
     Ok(addr)
+}
+
+/// Read the first non-whitespace byte of a file (cheap; opens then
+/// closes after at most ~64 bytes). Returns `None` on I/O error or all
+/// whitespace.
+fn first_nonws_byte(p: &Path) -> Option<u8> {
+    use std::io::Read;
+    let mut buf = [0u8; 64];
+    let mut f = fs::File::open(p).ok()?;
+    let n = f.read(&mut buf).ok()?;
+    for &b in &buf[..n] {
+        if !b.is_ascii_whitespace() { return Some(b); }
+    }
+    None
 }
 
 fn run_node(
@@ -487,6 +655,7 @@ fn run_node(
     ready_queue: ReadyQueue,
     running:     RunningCount,
     addr:        String,
+    #[cfg(feature = "model")] model: ModelState,
 ) {
     let deps = {
         let g = tree.lock().unwrap();
@@ -506,6 +675,8 @@ fn run_node(
                 let s = NodeState::Failed("dep failed".into());
                 update_record_state(&tree, &addr, s.clone());
                 publish_state(&workdir, &addr, &s, &subs);
+                #[cfg(feature = "model")]
+                record_training_sample(&tree, &model, &addr);
                 return;
             }
             if all_ok { break; }
@@ -516,13 +687,15 @@ fn run_node(
         publish_state(&workdir, &addr, &s, &subs);
     }
 
-    let priority = {
+    let (priority, subtree_size) = {
         let g = tree.lock().unwrap();
-        g.get(&addr).map(|r| r.priority).unwrap_or(0.0)
+        g.get(&addr)
+            .map(|r| (r.priority, r.subtree_size))
+            .unwrap_or((0.0, 1))
     };
     {
         let mut q = ready_queue.lock().unwrap();
-        q.push(QueueItem { priority, addr: addr.clone() });
+        q.push(QueueItem { subtree_size, priority, addr: addr.clone() });
     }
     loop {
         if SHUTDOWN.load(Ordering::SeqCst) { return; }
@@ -611,7 +784,48 @@ fn run_node(
             }
             update_record_state(&tree, &addr, s.clone());
             publish_state(&workdir, &addr, &s, &subs);
+            #[cfg(feature = "model")]
+            record_training_sample(&tree, &model, &addr);
         }
+    }
+}
+
+/// Append `(features, label)` for `addr` to the model's training buffer
+/// and trigger a retrain when `new_since_train` reaches the configured
+/// threshold. Label = "node had ≥ 2 transitive descendants by the time
+/// it finished" (the proxy for "on a critical path"). Bounded to
+/// `model_buffer_capacity()` via VecDeque pop_front.
+#[cfg(feature = "model")]
+fn record_training_sample(tree: &Tree, model: &ModelState, addr: &str) {
+    let (feats, label) = {
+        let g = tree.lock().unwrap();
+        let r = match g.get(addr) {
+            Some(r) => r,
+            None    => return,
+        };
+        let feats = match r.meta {
+            Some(m) => m.features,
+            None    => return,
+        };
+        let label = r.subtree_size >= 2;
+        (feats, label)
+    };
+
+    let cap   = model_buffer_capacity();
+    let every = model_retrain_every();
+
+    let mut m = model.lock().unwrap();
+    if m.buffer.len() == cap {
+        m.buffer.pop_front();
+    }
+    m.buffer.push_back((feats, label));
+    m.new_since_train += 1;
+    if m.new_since_train >= every {
+        let snap: Vec<(u16, bool)> = m.buffer.iter().copied().collect();
+        m.generation = m.generation.wrapping_add(1);
+        let gen_byte = m.generation;
+        m.tree = Tree32::train(&snap, gen_byte);
+        m.new_since_train = 0;
     }
 }
 
@@ -738,3 +952,95 @@ fn reaper_loop(tree: Tree, subs: SubMap, workdir: PathBuf) {
 
 // suppress unused warning for OP_STATE in match (decode helper used elsewhere)
 const _: u32 = tren::OP_STATE;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn qi(subtree_size: u64, priority: f64, addr: &str) -> QueueItem {
+        QueueItem { subtree_size, priority, addr: addr.into() }
+    }
+
+    #[test]
+    fn queue_item_orders_by_subtree_size_desc_then_priority_then_addr() {
+        // v0.4.0 default ordering: bigger subtree_size pops first; ties on
+        // subtree_size break by bigger priority; final tie breaks by
+        // lexicographically smaller addr.
+        let mut h: std::collections::BinaryHeap<QueueItem> =
+            std::collections::BinaryHeap::new();
+        h.push(qi(1, 0.0, "10"));     // small chain, leaf
+        h.push(qi(5, 0.0, "11"));     // long chain root
+        h.push(qi(1, 0.0, "100"));    // small chain, deeper leaf
+        h.push(qi(3, 0.0, "101"));    // medium chain root
+        h.push(qi(5, 0.0, "111"));    // tied with first long chain root, larger addr
+
+        let popped: Vec<String> = (0..5)
+            .map(|_| h.pop().unwrap().addr)
+            .collect();
+        // Expect: subtree_size 5/addr "11", subtree_size 5/addr "111",
+        //         subtree_size 3, then the two size-1 leaves by addr.
+        assert_eq!(popped, vec!["11", "111", "101", "10", "100"]);
+    }
+
+    #[test]
+    fn queue_item_priority_breaks_size_ties() {
+        // When subtree_size is tied, higher `priority` (the model's f64)
+        // pops first. Same-priority falls back to the addr tiebreaker.
+        let mut h: std::collections::BinaryHeap<QueueItem> =
+            std::collections::BinaryHeap::new();
+        h.push(qi(2, 0.10, "1"));
+        h.push(qi(2, 0.90, "100"));   // higher priority, should win despite bigger addr
+        h.push(qi(2, 0.50, "10"));
+
+        let popped: Vec<String> = (0..3)
+            .map(|_| h.pop().unwrap().addr)
+            .collect();
+        assert_eq!(popped, vec!["100", "10", "1"]);
+    }
+
+    #[test]
+    fn bump_ancestor_subtree_walks_transitive_dag() {
+        // Build a small DAG in memory and verify bump_ancestor_subtree
+        // increments every transitive ancestor exactly once per call,
+        // including diamond shapes where two paths share an ancestor.
+        let tree: Tree = Arc::new(Mutex::new(HashMap::new()));
+        let mk = |addr: &str, deps: Vec<&str>| -> NodeRecord {
+            NodeRecord {
+                deps:  deps.iter().map(|s| (*s).into()).collect(),
+                pid:   None,
+                state: NodeState::Pending,
+                priority:     0.0,
+                subtree_size: 1,
+                depth:        0,
+                cmd_first_byte: 0,
+                #[cfg(feature = "model")]
+                meta: None,
+            }
+        };
+        {
+            let mut g = tree.lock().unwrap();
+            g.insert("1".into(),    mk("1",    vec![]));
+            g.insert("10".into(),   mk("10",   vec!["1"]));
+            g.insert("11".into(),   mk("11",   vec!["1"]));
+            g.insert("110".into(),  mk("110",  vec!["10", "11"])); // diamond
+            g.insert("111".into(),  mk("111",  vec!["110"]));
+        }
+
+        // Each SUBMIT bumps its dep ancestors once. Simulate the whole
+        // submission sequence in order.
+        bump_ancestor_subtree(&tree, &[]);                         // node "1"
+        bump_ancestor_subtree(&tree, &["1".into()]);               // node "10"
+        bump_ancestor_subtree(&tree, &["1".into()]);               // node "11"
+        bump_ancestor_subtree(&tree, &["10".into(), "11".into()]); // node "110"
+        bump_ancestor_subtree(&tree, &["110".into()]);             // node "111"
+
+        let g = tree.lock().unwrap();
+        // "1" sits above everyone: bumped by 10, 11, 110 (via both paths
+        // but counted once thanks to the visited set), and 111.
+        assert_eq!(g.get("1").unwrap().subtree_size,   5);
+        assert_eq!(g.get("10").unwrap().subtree_size,  3); // bumped by 110, 111
+        assert_eq!(g.get("11").unwrap().subtree_size,  3); // bumped by 110, 111
+        assert_eq!(g.get("110").unwrap().subtree_size, 2); // bumped by 111
+        assert_eq!(g.get("111").unwrap().subtree_size, 1); // never an ancestor
+    }
+}

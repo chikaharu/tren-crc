@@ -1,5 +1,21 @@
 //! tren — PWD-local sparse-binary-tree job scheduler core library.
 //!
+//! v0.4.0 changes vs v0.3.x:
+//! * Default (feature OFF) ready-queue priority is now **subtree-size
+//!   descending**. Each node tracks `subtree_size` and SUBMIT bumps every
+//!   transitive ancestor by 1, so jobs that root a long chain (i.e. lie
+//!   on the critical path) drain the queue ahead of leaf-only jobs.
+//! * `feature = "model"` no longer fork-execs an external `tren-model`
+//!   binary. Instead the wrapper carries an in-process **Frame32-resident
+//!   decision tree** (depth-4 ID3, branchless infer, 128-byte tree),
+//!   trains on accumulated SUBMIT outcomes, and infers per-job priority
+//!   in tens of instructions. The external `tren-model` interface is
+//!   gone (breaking change) — see `src/priority.rs`.
+//! * Tunables: `TREN_MODEL_BUFFER` (training-buffer cap, default 256) and
+//!   `TREN_MODEL_RETRAIN_EVERY` (samples between retrains, default 32).
+//! * New `bench_priority` binary compares FIFO / subtree-size / decision
+//!   tree on random DAGs.
+//!
 //! v0.3.0 changes vs v0.2.x:
 //! * Workdir naming changed from `.tren-<uuid>/` to `.tren-NNN-<uuid>/`
 //!   (3-digit zero-padded sequence; auto-extends to 4 digits past 999).
@@ -56,6 +72,8 @@ use std::io::{self, Read, Write};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+pub mod priority;
 
 pub const WORKDIR_PREFIX: &str = ".tren-";
 
