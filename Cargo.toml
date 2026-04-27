@@ -1,11 +1,10 @@
 [package]
   name    = "tren-crc"
-  version = "0.5.0-crc.2"
+  version = "0.5.0-crc.3"
   edition = "2021"
 
   [features]
-  model        = []
-  experimental = ["dep:rand"]
+  model = []
 
   [lib]
   name = "tren"
@@ -14,22 +13,9 @@
   [dependencies]
   libc   = "0.2"
   crc32c = "0.6"
-  rand   = { version = "0.8", optional = true }
 
-  [[example]]
-  name              = "exp_even_bit"
-  path              = "examples/exp_even_bit.rs"
-  required-features = ["experimental"]
-
-  [[example]]
-  name              = "bench_crc_impls"
-  path              = "examples/bench_crc_impls.rs"
-  required-features = ["experimental"]
-
-  [[example]]
-  name              = "exp_diagonal_entropy"
-  path              = "examples/exp_diagonal_entropy.rs"
-  required-features = ["experimental"]
+  [dev-dependencies]
+  frame32-scatter = { git = "https://github.com/chikaharu/frame32-scatter", branch = "main" }
 
   [[bin]]
   name = "tren-wrapper"
@@ -94,4 +80,3 @@
   [[bin]]
   name = "bench_priority"
   path = "src/bin/bench_priority.rs"
-  
