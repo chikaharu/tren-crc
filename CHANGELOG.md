@@ -11,6 +11,26 @@
 
   ## [Unreleased]
 
+  ### Added
+
+  - **Hybrid HW-CRC × Hadamard 4-frame group available via the
+    upstream `frame32-scatter` dev-dependency.** The new
+    [`hybrid_hadamard::HybridFrame4`](https://github.com/chikaharu/frame32-scatter/blob/main/src/hybrid_hadamard.rs)
+    type (Task #37) provides a 512-byte 4 × `Frame32` group with a
+    binary `[4, 1, 4]` Hadamard simplex outer code. Inner frames keep
+    full HW CRC-32C detection; the decoder uses CRC erasure
+    indication, so up to **3 of 4 inner frames may be fully wiped**
+    and the 31-bit information word still recovers (4-frame loss is
+    still 100 % detected as `AllFramesCorrupted`). Measured on this
+    hardware: 100 % correction on k = 1, 2, 3 simultaneously
+    corrupted frames across 6 error classes (5 000 trials each,
+    Wilson 95 % LB ≥ 0.9992); HW-path verify throughput drops from
+    3431.5 MiB/s solo to 3177.1 MiB/s hybrid (= **0.926× wire,
+    ≈7.4 % overhead**). Full write-up:
+    [`docs/hybrid_hadamard.md`](https://github.com/chikaharu/frame32-scatter/blob/main/docs/hybrid_hadamard.md).
+    No tren-crc source change — the dev-dep already pins
+    `frame32-scatter` to its `main` branch.
+
   ### Removed
 
   - **Experimental research harness extracted to its own crate.**
