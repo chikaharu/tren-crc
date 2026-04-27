@@ -20,6 +20,15 @@
     (`Diagonal`, `AntiDiagonal`, `Permuted`, `Hadamard` — the latter is intentionally lossy with majority-vote
     read), and a small min/median/p99/throughput bench harness (`research::bench`). Default builds and
     `--features model` builds are unaffected.
+  - **Experimental `parity_layer` module + `exp_even_bit` example** (`src/research/parity_layer.rs`,
+    `examples/exp_even_bit.rs`, gated behind the `experimental` feature). Adds `ParityLayout` with four
+    variants (`Crc32Only`, `RowXorPlusCrc { k }`, `ColXorPlusCrc { k }`, `SplitOddEven16`) and a sweep
+    example that compares detection rates against the production CRC-32C-only layout. **Negative result**:
+    within the spec range (n ≤ 32 bit flips, burst ≤ 32) all 154 cells × 10,000 trials hit 100 % detection,
+    so re-budgeting CRC bits to an auxiliary parity layer (row/column XOR or split CRC-16/IBM + CRC-16/CCITT
+    over odd/even diagonal positions) yields no observable improvement. Full theory and analysis in
+    [`docs/research/even_bit_detection.md`](docs/research/even_bit_detection.md). CI builds the example to
+    keep it from bit-rotting; running the sweep itself is left to maintainers.
 
   ### Changed
 
