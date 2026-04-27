@@ -874,3 +874,146 @@ fn spillover_creates_second_spill_past_32_leaves() {
     }
     thread::sleep(Duration::from_millis(200));
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.4.0: subtree-size default priority + in-process Frame32 decision tree
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn subtree_size_chain_runs_to_completion_under_v04_default_priority() {
+    // v0.4.0 default (feature OFF) priority is `subtree_size desc`. The
+    // exact pop order is timing-dependent under heavy parallel load
+    // (covered by deterministic unit tests in `tren_wrapper.rs::tests`
+    // and `priority::tests`). At the integration level we still want to
+    // confirm that:
+    //   * the new priority codepath runs end-to-end without deadlocks
+    //     when many siblings + a long chain are queued behind workers,
+    //   * dependency edges are honoured (chain runs in topological
+    //     order: j1 -> j2 -> ... -> j5 -> j6),
+    //   * sibling no-dep jobs (n1..n4) all complete cleanly.
+    let sb = Sandbox::new("subtree_prio_v04");
+    let log = sb.dir.join("order.log");
+    let log_str = log.display().to_string();
+
+    // Submit a chain rooted at j1 (depth 6). Each chained SUBMIT bumps
+    // every transitive ancestor's subtree_size, so by the end j1.size=6.
+    let j1 = tren::submit_cmd(&sb.dir, &[],
+        &format!("echo j1 >> {}", log_str)).expect("submit j1");
+    let j2 = tren::submit_cmd(&sb.dir, &[j1.addr.clone()],
+        &format!("echo j2 >> {}", log_str)).expect("submit j2");
+    let j3 = tren::submit_cmd(&sb.dir, &[j2.addr.clone()],
+        &format!("echo j3 >> {}", log_str)).expect("submit j3");
+    let j4 = tren::submit_cmd(&sb.dir, &[j3.addr.clone()],
+        &format!("echo j4 >> {}", log_str)).expect("submit j4");
+    let j5 = tren::submit_cmd(&sb.dir, &[j4.addr.clone()],
+        &format!("echo j5 >> {}", log_str)).expect("submit j5");
+    let j6 = tren::submit_cmd(&sb.dir, &[j5.addr.clone()],
+        &format!("echo j6 >> {}", log_str)).expect("submit j6");
+
+    // Submit several no-dep siblings. These exercise the queue pop path
+    // alongside the chain.
+    let mut n_addrs: Vec<String> = Vec::new();
+    for i in 0..4 {
+        let r = tren::submit_cmd(&sb.dir, &[],
+            &format!("echo n{} >> {}", i, log_str)).expect("submit n");
+        n_addrs.push(r.addr);
+    }
+
+    // Wait for everything via qwait.
+    let mut all: Vec<&str> = vec![
+        j1.addr.as_str(), j2.addr.as_str(), j3.addr.as_str(),
+        j4.addr.as_str(), j5.addr.as_str(), j6.addr.as_str(),
+    ];
+    for a in &n_addrs { all.push(a.as_str()); }
+    let exit = sb.qwait(&all);
+    assert_eq!(exit, 0, "qwait of all jobs should exit 0");
+
+    let contents = std::fs::read_to_string(&log)
+        .unwrap_or_else(|e| panic!("read {}: {e}", log.display()));
+    let lines: Vec<&str> = contents.lines().collect();
+    let pos = |tag: &str| -> usize {
+        lines.iter().position(|l| l.trim() == tag)
+            .unwrap_or_else(|| panic!("missing {} in log:\n{}", tag, contents))
+    };
+
+    // Topological order MUST be honoured: each chain step only runs
+    // after its predecessor.
+    assert!(pos("j1") < pos("j2"), "j1 must finish before j2:\n{}", contents);
+    assert!(pos("j2") < pos("j3"), "j2 must finish before j3:\n{}", contents);
+    assert!(pos("j3") < pos("j4"), "j3 must finish before j4:\n{}", contents);
+    assert!(pos("j4") < pos("j5"), "j4 must finish before j5:\n{}", contents);
+    assert!(pos("j5") < pos("j6"), "j5 must finish before j6:\n{}", contents);
+
+    // All siblings completed.
+    for i in 0..4 {
+        let _ = pos(&format!("n{}", i)); // panics if missing
+    }
+}
+
+#[cfg(feature = "model")]
+#[test]
+fn model_build_works_without_external_tren_model_in_path() {
+    // v0.4.0: under `--features model` the wrapper must do all priority
+    // inference IN-PROCESS via the Frame32-resident decision tree. The old
+    // `call_model` fork-exec is gone, so the wrapper must run successfully
+    // even when PATH is empty (no `tren-model` binary discoverable anywhere).
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let dir = std::env::temp_dir().join(format!(
+        "tren-smoke-nopath-{}-{}", std::process::id(), stamp));
+    std::fs::create_dir_all(&dir).expect("mkdir nopath sandbox");
+
+    // Spawn the wrapper with PATH cleared. If the model build still tried
+    // to fork-exec `tren-model`, the SUBMIT below would either hang on the
+    // 5s UDP timeout or come back with a degraded reply.
+    let mut wrapper = Command::new(WRAPPER)
+        .current_dir(&dir)
+        .env_clear()
+        .env("HOME", &dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn tren-wrapper with empty PATH");
+
+    // Wait for workdir to come up.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut found = false;
+    while Instant::now() < deadline {
+        if Sandbox::find_workdir(&dir).is_some() { found = true; break; }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(found, "wrapper without PATH did not create workdir");
+
+    // Submit a few jobs through the lib API (exercises the model inference
+    // path) and verify they complete normally.
+    let mut addrs = Vec::new();
+    for i in 0..3 {
+        let r = tren::submit_cmd(&dir, &[], &format!("echo nopath_{}", i))
+            .expect("submit_cmd in no-PATH wrapper");
+        addrs.push(r.addr);
+    }
+
+    let qwait_status = Command::new(QWAIT)
+        .args(addrs.iter().map(String::as_str))
+        .current_dir(&dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("spawn qwait");
+    assert_eq!(qwait_status.code().unwrap_or(-1), 0,
+        "qwait should exit 0 when wrapper runs in-process model with no PATH");
+
+    // Cleanup.
+    if let Some(workdir) = Sandbox::find_workdir(&dir) {
+        if let Ok(p) = std::fs::read_to_string(workdir.join("port")) {
+            if let Ok(port) = p.trim().parse::<u16>() {
+                let _ = tren::send_quit(port);
+            }
+        }
+    }
+    let _ = wrapper.kill();
+    let _ = wrapper.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+}
