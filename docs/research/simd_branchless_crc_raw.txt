@@ -1,0 +1,16 @@
+# CRC-32C operator zoo benchmark
+
+Frame size: 1024 bits (128 bytes). Reported numbers are per-frame; 4-way SIMD calls are amortised over 4 frames.
+
+| Implementation | frames/call | iters | min (ns) | median (ns) | p99 (ns) | frames/sec | GiB/s |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| crc32c_hw (crc32c crate) | 1 | 200000 | 40 | 40 | 70 | 21645795 | 2.580 |
+| crc32c_table (Sarwate 8-bit) | 1 | 200000 | 309 | 310 | 360 | 3085597 | 0.368 |
+| crc32c_slice_by_8 | 1 | 200000 | 80 | 90 | 130 | 10699885 | 1.276 |
+| crc32c_branchless_bitwise | 1 | 200000 | 610 | 620 | 850 | 1543995 | 0.184 |
+| crc32c_branchless_bitwise_v2 (xnor/nand/xor3) | 1 | 200000 | 549 | 560 | 730 | 1710127 | 0.204 |
+| crc32c_popcount_xor | 1 | 200000 | 610 | 620 | 1160 | 1472818 | 0.176 |
+| crc32c_simd_sse2_x4 | 4 | 50000 | 740 | 790 | 960 | 4969582 | 0.592 |
+| crc32c_simd_avx2_x4 | 4 | 50000 | 990 | 1040 | 1180 | 3756449 | 0.448 |
+
+_All implementations agree with `crc32c_hw` on the first frame._

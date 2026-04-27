@@ -21,6 +21,11 @@
   path              = "examples/exp_even_bit.rs"
   required-features = ["experimental"]
 
+  [[example]]
+  name              = "bench_crc_impls"
+  path              = "examples/bench_crc_impls.rs"
+  required-features = ["experimental"]
+
   [[bin]]
   name = "tren-wrapper"
   path = "src/bin/tren_wrapper.rs"

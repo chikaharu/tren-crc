@@ -29,6 +29,21 @@
     over odd/even diagonal positions) yields no observable improvement. Full theory and analysis in
     [`docs/research/even_bit_detection.md`](docs/research/even_bit_detection.md). CI builds the example to
     keep it from bit-rotting; running the sweep itself is left to maintainers.
+  - **Experimental CRC-32C operator zoo** (`src/research/crc_impls.rs`, `src/research/bool_ops.rs`,
+    `examples/bench_crc_impls.rs`, `tests/crc_impls_consistency.rs`, gated behind the `experimental`
+    feature). Eight side-by-side implementations of CRC-32C — `crc32c_hw` (production reference, SSE
+    4.2 hardware), `crc32c_table` (Sarwate 8-bit), `crc32c_slice_by_8`, `crc32c_branchless_bitwise`
+    and `_v2` (XNOR/NAND/XOR3 helpers from `bool_ops`), `crc32c_popcount_xor` (GF(2)-linear basis),
+    `crc32c_simd_sse2_x4`, and `crc32c_simd_avx2_x4` — all bit-exact verified against the production
+    reference on 10,000 random 128-byte messages. Benchmark example reports min/median/p99 latency
+    and throughput in frames-per-second / GiB/s. **Result: production `crc32c_hw` (~40 ns/frame,
+    2.58 GiB/s) remains the right choice; the closest software alternative
+    (`crc32c_slice_by_8`, ~90 ns/frame) is 2.3× slower, branchless and SIMD variants are
+    14×–15× slower per frame**. Notably, `crc32c_simd_avx2_x4` is _slower_ than
+    `crc32c_simd_sse2_x4` because the spec-mandated 4-lane signature leaves AVX2's upper four
+    lanes idle, paying the wider instruction cost without parallelism gain. Full theory, results,
+    and trade-offs in [`docs/research/simd_branchless_crc.md`](docs/research/simd_branchless_crc.md).
+    CI builds the bench example to keep it from bit-rotting.
 
   ### Changed
 

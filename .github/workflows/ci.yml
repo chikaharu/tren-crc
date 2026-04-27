@@ -39,3 +39,6 @@ jobs:
       - name: cargo build experimental example exp_even_bit
         run: cargo build --release --example exp_even_bit --features experimental
         timeout-minutes: 15
+      - name: cargo build experimental example bench_crc_impls
+        run: cargo build --release --example bench_crc_impls --features experimental
+        timeout-minutes: 15
