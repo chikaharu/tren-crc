@@ -1,11 +1,6 @@
 //! qrun — convenience wrapper that submits a command, waits for it, then
 //! appends `1`/`-1` to a marker file.
 //!
-//! This binary is a minimal port of the daemon-era qrun. The complex
-//! `--parallel` / `--per-block-marker` modes have been simplified to use
-//! the new tren wrapper protocol; see qsub + qwait + qbind for richer
-//! composition.
-//!
 //! Usage:
 //!   qrun [--marker <path>] [--any] <cmd> [args...]
 //!   qrun [--marker <path>] --parallel <cmd1> ::: <cmd2> ::: ...
@@ -14,9 +9,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Duration;
 
-use tren::{connect_or_spawn, encode_text, udp_request};
+use tren::submit_cmd;
 
 const RELEASE_QWAIT: &str =
     "/home/runner/workspace/artifacts/bitrag/scheduler/target/release/qwait";
@@ -37,17 +31,6 @@ fn resolve_qwait() -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn submit(port: u16, cmd: &str) -> Result<String, String> {
-    let req = format!("SUBMIT\n\n{}\n", encode_text(cmd));
-    udp_request(port, &req, Duration::from_secs(5))
-        .map_err(|e| e.to_string())
-        .and_then(|r| {
-            let r = r.trim().to_string();
-            if let Some(a) = r.strip_prefix("OK ") { Ok(a.to_string()) }
-            else { Err(r) }
-        })
 }
 
 fn append_marker(marker: &PathBuf, value: &str) {
@@ -90,10 +73,6 @@ fn main() {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let (_, port) = match connect_or_spawn(&cwd, true) {
-        Ok(p) => p,
-        Err(e) => { eprintln!("qrun: {}", e); std::process::exit(1); }
-    };
 
     let cmds: Vec<String> = if parallel {
         let mut out: Vec<String> = Vec::new();
@@ -113,8 +92,8 @@ fn main() {
 
     let mut addrs: Vec<String> = Vec::new();
     for c in &cmds {
-        match submit(port, c) {
-            Ok(a)  => { eprintln!("[qrun] {}: {}", a, c); addrs.push(a); }
+        match submit_cmd(&cwd, &[], c) {
+            Ok(r)  => { eprintln!("[qrun] {}: {}", r.addr, c); addrs.push(r.addr); }
             Err(e) => { eprintln!("qrun: submit '{}': {}", c, e); std::process::exit(1); }
         }
     }

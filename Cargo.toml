@@ -68,4 +68,8 @@
   [[bin]]
   name = "bench_idtree"
   path = "src/bin/bench_idtree.rs"
+
+  [[bin]]
+  name = "bench_namespace"
+  path = "src/bin/bench_namespace.rs"
   
