@@ -1,6 +1,6 @@
 [package]
   name    = "tren-crc"
-  version = "0.5.0-crc.1"
+  version = "0.5.0-crc.3"
   edition = "2021"
 
   [features]
@@ -13,6 +13,9 @@
   [dependencies]
   libc   = "0.2"
   crc32c = "0.6"
+
+  [dev-dependencies]
+  frame32-scatter = { git = "https://github.com/chikaharu/frame32-scatter", branch = "main" }
 
   [[bin]]
   name = "tren-wrapper"
@@ -77,4 +80,3 @@
   [[bin]]
   name = "bench_priority"
   path = "src/bin/bench_priority.rs"
-  

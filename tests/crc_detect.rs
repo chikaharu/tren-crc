@@ -229,3 +229,80 @@ fn verify_crc_rejects_legal_looking_diagonal_corruption() {
     for i in 0..32 { tampered.0[i] ^= 1u32 << i; }
     assert!(!tampered.verify_crc(), "tampered diagonal must fail verify_crc");
 }
+
+#[test]
+fn nbit_flip_detection_rate_sweep() {
+    // Sweep n-bit random flip detection rate for n = 1 … 512.
+    //
+    // CRC-32C properties:
+    //   n=1       : 100% guaranteed (all single-bit errors detected)
+    //   n=2       : 100% guaranteed (HD ≥ 4 for 1024-bit messages)
+    //   n=3       : 100% guaranteed (HD ≥ 4)
+    //   n odd     : 100% guaranteed ((x+1) | generator polynomial)
+    //   n even >3 : ≈(1 - 2^-32) per trial — statistically indistinguishable
+    //               from 100% at any practical sample size
+    //
+    // Run with `cargo test -- --nocapture` to see the detection-rate table.
+    //
+    // Contrast: under the old XOR-parity scheme, flipping all 32 diagonal
+    // bits (one bit per slot) was UNDETECTED (each diagonal bit was its own
+    // parity so flipping it just looked like a new valid parity). CRC-32C
+    // catches every such pattern — confirmed by diagonal_bit_flip_alone_is_detected.
+
+    const TRIALS: usize = 500;
+    let bytes_orig = sample_frame().to_bytes();
+
+    // n values to sweep: small (provably 100%), medium, large
+    let ns: &[usize] = &[1, 2, 3, 4, 5, 6, 7, 8, 16, 32, 33, 64, 128, 256, 512];
+
+    let mut rng = Lcg(0xDECA_FBAD_1337_CAFE);
+
+    eprintln!("\n{:>6}  {:>9}  {:>7}", "n bits", "detected", "rate");
+    eprintln!("{}", "-".repeat(28));
+
+    for &n in ns {
+        let mut detected = 0usize;
+
+        for _ in 0..TRIALS {
+            // Pick n distinct random bit positions (0..1024) to flip.
+            let mut positions: Vec<usize> = Vec::with_capacity(n);
+            while positions.len() < n {
+                let pos = rng.range(1024) as usize;
+                if !positions.contains(&pos) {
+                    positions.push(pos);
+                }
+            }
+            let mut bytes = bytes_orig;
+            for &p in &positions {
+                flip_bit(&mut bytes, p);
+            }
+            if matches!(Frame32::from_bytes(&bytes), Err(FrameError::CrcMismatch)) {
+                detected += 1;
+            }
+        }
+
+        let rate_pct = detected as f64 / TRIALS as f64 * 100.0;
+        eprintln!("n={:4}:  {:4}/{:4}  = {:6.2}%", n, detected, TRIALS, rate_pct);
+
+        // Assert correctness:
+        //   n ≤ 3 or odd  →  provably 100%, require exact
+        //   even n > 3    →  ≥ 499/500 (miss rate 1/2^32 makes < 1 miss
+        //                     expected over the entire lifetime of the universe)
+        if n <= 3 || n % 2 == 1 {
+            assert_eq!(
+                detected, TRIALS,
+                "n={}: CRC-32C guarantees 100% detection but got {}/{}",
+                n, detected, TRIALS
+            );
+        } else {
+            assert!(
+                detected >= TRIALS - 1,
+                "n={}: expected ≥499/500 detection, got {}/{}",
+                n, detected, TRIALS
+            );
+        }
+    }
+
+    eprintln!("{}", "-".repeat(28));
+    eprintln!("All {} n-values verified.\n", ns.len());
+}
