@@ -204,7 +204,7 @@ impl Tree32 {
         // slot 4: leaf-confidence mask
         f.set(4, self.leaf_pure as u32);
 
-        f.update_parity();
+        f.update_crc();
         f
     }
 
@@ -407,7 +407,7 @@ mod tests {
         t.gen       = 42;
 
         let frame = t.to_frame();
-        assert!(frame.verify_parity(), "tree frame must satisfy diagonal parity");
+        assert!(frame.verify_crc(), "tree frame must satisfy diagonal CRC-32C");
         let restored = Tree32::from_frame(&frame).expect("magic ok");
         assert_eq!(restored, t);
     }
@@ -416,7 +416,7 @@ mod tests {
     fn from_frame_rejects_non_tree() {
         let mut not_a_tree = Frame32::new();
         not_a_tree.set_header(crate::OP_SUBMIT, 0);
-        not_a_tree.update_parity();
+        not_a_tree.update_crc();
         assert!(Tree32::from_frame(&not_a_tree).is_none());
     }
 

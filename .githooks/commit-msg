@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# commit-msg: ensure work commits on develop/experiment carry an
+# `Authored-on: <branch>` trailer that matches the current branch.
+#
+# See COMMIT_RULE.md.
+
+set -e
+
+msg_file="$1"
+branch="$(git symbolic-ref --short -q HEAD || true)"
+
+if [ "$branch" != "develop" ] && [ "$branch" != "experiment" ]; then
+    exit 0
+fi
+
+# Skip merge commits — `git merge` injects "Merge branch ..." subject and
+# we never expect an Authored-on trailer on those. (We use --ff-only for
+# relay merges so this normally doesn't even fire on develop/experiment.)
+if [ -f "$(git rev-parse --git-dir)/MERGE_MSG" ]; then
+    exit 0
+fi
+
+trailer="$(grep -E '^Authored-on:[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*$' "$msg_file" | tail -n1 | sed 's/^Authored-on:[[:space:]]*//;s/[[:space:]]*$//')"
+
+if [ -z "$trailer" ]; then
+    cat >&2 <<EOF
+[commit-msg] Missing trailer.
+Work commits on `develop`/`experiment` must end with a line like:
+
+    Authored-on: $branch
+
+See COMMIT_RULE.md.
+EOF
+    exit 1
+fi
+
+if [ "$trailer" != "$branch" ]; then
+    cat >&2 <<EOF
+[commit-msg] Trailer mismatch.
+HEAD branch is `$branch` but commit message claims `Authored-on: $trailer`.
+Either checkout the right branch or fix the trailer.
+EOF
+    exit 1
+fi
+
+exit 0
