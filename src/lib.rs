@@ -75,6 +75,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod priority;
 
+#[cfg(feature = "experimental")]
+pub mod research;
+
 pub const WORKDIR_PREFIX: &str = ".tren-";
 
 /// Maximum leaves allowed in one spill. The 33rd leaf triggers spillover

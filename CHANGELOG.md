@@ -11,6 +11,21 @@
 
   ## [Unreleased]
 
+  ### Added
+
+  - **Experimental research harness** (`src/research/`, gated behind the new `experimental` cargo feature).
+    Provides shared building blocks for the planned CRC-32C experiments: deterministic random `Frame32`
+    generators (`research::data`), bit-error injectors (`research::inject`), Wilson detection-rate intervals
+    and plug-in entropy estimators (`research::stats`), a `ScatterPattern` trait with four implementations
+    (`Diagonal`, `AntiDiagonal`, `Permuted`, `Hadamard` — the latter is intentionally lossy with majority-vote
+    read), and a small min/median/p99/throughput bench harness (`research::bench`). Default builds and
+    `--features model` builds are unaffected.
+
+  ### Changed
+
+  - **`rand` added as an optional dependency**, activated only by `--features experimental`. Default builds
+    and `--features model` builds still have no `rand` in their dependency tree.
+
   ## [v0.5.0-crc.1] - 2026-04-27
 
   ### Changed

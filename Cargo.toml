@@ -1,10 +1,11 @@
 [package]
   name    = "tren-crc"
-  version = "0.5.0-crc.1"
+  version = "0.5.0-crc.2"
   edition = "2021"
 
   [features]
-  model = []
+  model        = []
+  experimental = ["dep:rand"]
 
   [lib]
   name = "tren"
@@ -13,6 +14,7 @@
   [dependencies]
   libc   = "0.2"
   crc32c = "0.6"
+  rand   = { version = "0.8", optional = true }
 
   [[bin]]
   name = "tren-wrapper"

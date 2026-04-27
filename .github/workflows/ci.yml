@@ -33,3 +33,6 @@ jobs:
       - name: cargo test (--features model)
         run: cargo test --features model
         timeout-minutes: 15
+      - name: cargo test (--features experimental)
+        run: cargo test --features experimental
+        timeout-minutes: 15
