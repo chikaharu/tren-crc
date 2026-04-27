@@ -44,6 +44,31 @@
     lanes idle, paying the wider instruction cost without parallelism gain. Full theory, results,
     and trade-offs in [`docs/research/simd_branchless_crc.md`](docs/research/simd_branchless_crc.md).
     CI builds the bench example to keep it from bit-rotting.
+  - **Experimental scatter-pattern conditional-entropy sweep**
+    (`src/research/entropy_sweep.rs`, `examples/exp_diagonal_entropy.rs`,
+    gated behind the `experimental` feature). Compares four `ScatterPattern`
+    layouts (`Diagonal`, `AntiDiagonal`, `Permuted`, `Hadamard`) on (a) plug-in
+    Miller-Madow conditional-entropy estimates `H(diag | body_bucket)` at
+    bucket widths 8/16/32 bits and (b) detection rates against six error
+    classes (`Random(8)`, `Random(32)`, `Burst(16)`, `Burst(32)`,
+    `EvenBit(16)`, `DiagonalOnly(8)`). Sweep runs 4 patterns × 6 error classes
+    × 10,000 trials + 4 patterns × 3 bucket widths × 100,000 entropy samples
+    (~1.1 s on a release build). **Negative result** (and the right kind):
+    the three full-32-bit-CRC patterns produce identical detection rates
+    (100 % across all six error classes) and identical entropy estimates
+    (H(diag) ≈ 17.33 bits saturated by N=100k), confirming that scatter
+    choice is irrelevant to detection power among 32-bit-CRC layouts —
+    CRC linearity makes the original hypothesis "H(diag|body) low → detection
+    strong" trivially `0 ≤ 0` with no discriminating power. The lossy
+    `Hadamard` pattern (8 information bits with majority-vote read) drops to
+    **81.1 % detection on `DiagonalOnly(8)`** because flipping 1 of 4 replicas
+    is corrected by majority vote, quantitatively confirming this is a
+    fundamental weakness of the lossy design. Production `Diagonal` should
+    stay; full theory, results, and the reformulated hypothesis ("H(diag)
+    saturation = information-bit count is the real predictor") in
+    [`docs/research/diagonal_entropy.md`](docs/research/diagonal_entropy.md).
+    Raw TSV `docs/research/diagonal_entropy_data.tsv` is committed for later
+    plotting.
 
   ### Changed
 

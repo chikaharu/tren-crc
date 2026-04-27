@@ -16,6 +16,7 @@ pub mod bench;
 pub mod bool_ops;
 pub mod crc_impls;
 pub mod data;
+pub mod entropy_sweep;
 pub mod inject;
 pub mod parity_layer;
 pub mod scatter;
