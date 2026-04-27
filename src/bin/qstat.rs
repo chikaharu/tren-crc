@@ -33,7 +33,9 @@ fn main() {
             let depth = depth_of(id);
             let state = read_state(&workdir, &addr);
             let pid   = read_node_file(&workdir, &addr, "pid").unwrap_or_default();
-            let cmd   = read_node_file(&workdir, &addr, "cmd").unwrap_or_default();
+            let cmd   = read_node_file(&workdir, &addr, "cmd.sh")
+                .or_else(|_| read_node_file(&workdir, &addr, "cmd"))
+                .unwrap_or_default();
             println!("{:<10} {:>4} {:<14} {:<12} {}",
                 addr, depth, state.label(), pid.trim(),
                 cmd.lines().next().unwrap_or(""));
