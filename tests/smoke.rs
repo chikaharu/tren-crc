@@ -125,11 +125,7 @@
           if let Some(workdir) = Self::find_workdir(&self.dir) {
               if let Ok(port_str) = std::fs::read_to_string(workdir.join("port")) {
                   if let Ok(port) = port_str.trim().parse::<u16>() {
-                      let _ = tren::udp_request(
-                          port,
-                          "QUIT\n",
-                          Duration::from_millis(500),
-                      );
+                      let _ = tren::send_quit(port);
                   }
               }
           }
@@ -243,9 +239,7 @@
                   let port_str = std::fs::read_to_string(workdir.join("port"))
                       .expect("read port file");
                   let port: u16 = port_str.trim().parse().expect("parse port");
-                  let _ = tren::udp_request(
-                      port, "QUIT\n", Duration::from_millis(500),
-                  );
+                  let _ = tren::send_quit(port);
               }
           }
 
@@ -325,9 +319,7 @@
       if let Some(wd) = workdirs.first() {
           if let Ok(port_str) = std::fs::read_to_string(wd.join("port")) {
               if let Ok(port) = port_str.trim().parse::<u16>() {
-                  let _ = tren::udp_request(
-                      port, "QUIT\n", Duration::from_millis(500),
-                  );
+                  let _ = tren::send_quit(port);
               }
           }
       }
@@ -710,3 +702,175 @@ e_special!(e097_more, "echo a > /tmp/tren_test_$$_unused && rm -f /tmp/tren_test
 e_special!(e098_more, "true > /dev/null 2>&1");
 e_special!(e099_more, "{ echo grouped; }");
 e_special!(e100_more, "true # trailing comment");
+
+// ═══════════════════════════════════════════════════════════════════════════
+// v0.3.0: Frame32, cmd.sh delivery, namespace, spillover
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn frame32_roundtrip_and_parity() {
+    use tren::{build_submit, decode_submit, Frame32, OP_SUBMIT};
+    let deps = vec![3u64, 5, 7, 11];
+    let token = 0xDEAD_BEEF & 0x7FFF_FFFF;
+    let f = build_submit(&deps, token, 0);
+    assert_eq!(f.op(), OP_SUBMIT);
+
+    // Round-trip via bytes (also forces parity update + verify).
+    let bytes = f.to_bytes();
+    assert_eq!(bytes.len(), 128);
+    let g = Frame32::from_bytes(&bytes).expect("frame parses");
+    assert_eq!(g.op(), OP_SUBMIT);
+    let (got_deps, got_tok) = decode_submit(&g).expect("decode");
+    assert_eq!(got_deps, deps);
+    assert_eq!(got_tok, token);
+
+    // Single-bit corruption MUST be detected by the diagonal parity check.
+    let mut bad = bytes;
+    bad[17] ^= 0x04; // flip one data bit deep in the frame
+    assert!(matches!(
+        Frame32::from_bytes(&bad),
+        Err(tren::FrameError::ParityMismatch)
+    ), "single-bit flip should fail parity verification");
+}
+
+#[test]
+fn frame32_data_slot_roundtrip_all_positions() {
+    // The "diagonal parity" bit in slot[i] is bit i. The set/get helpers
+    // must round-trip a 31-bit data value through every slot, never
+    // colliding with the parity bit.
+    use tren::Frame32;
+    for slot in 0..32usize {
+        let mut f = Frame32::new();
+        // Use a different bit-pattern for each slot to catch off-by-one bugs.
+        let value = (0x55AA_55AAu32 ^ (slot as u32 * 17)) & 0x7FFF_FFFF;
+        f.set(slot, value);
+        f.update_parity();
+        assert_eq!(f.get(slot), value, "slot {} round-trip mismatch", slot);
+        assert!(f.verify_parity(), "slot {} parity invalid", slot);
+    }
+}
+
+#[test]
+fn cmd_sh_delivery_multiline_commands_work() {
+    // Verify the inbox→cmd.sh rename pipeline handles multi-line shell
+    // bodies (the old text protocol couldn't carry these reliably).
+    let sb = Sandbox::new("multiline");
+    let multi = "echo first
+echo second
+exit 7";
+    let (rc, stdout, _stderr) = sb.qsub_raw(&[multi]);
+    let addr = stdout.trim().to_string();
+    assert!(!addr.is_empty(), "no addr returned");
+    assert_eq!(rc, 1, "exit 7 should propagate as qsub rc=1");
+    assert_eq!(sb.read_node_state(&addr), "DONE(7)");
+
+    let workdir = Sandbox::find_workdir(&sb.dir).expect("workdir gone");
+    let cmd_sh = workdir.join("tree").join(&addr).join("cmd.sh");
+    let body = std::fs::read_to_string(&cmd_sh).expect("read cmd.sh");
+    assert!(body.contains("echo first"));
+    assert!(body.contains("echo second"));
+    assert!(body.contains("exit 7"));
+    let log = std::fs::read_to_string(workdir.join("tree").join(&addr).join("log"))
+        .unwrap_or_default();
+    assert!(log.contains("first") && log.contains("second"));
+}
+
+#[test]
+fn namespace_token_propagates_to_qbind_subjobs() {
+    // qbind sets TREN_NS=<token> in the executed shell. Two concurrent
+    // qbind calls must produce two distinct namespace tokens.
+    let sb = Sandbox::new("ns");
+    let parent = sb.qsub(&["true"]);
+    let qbind_bin = env!("CARGO_BIN_EXE_qbind");
+
+    let mk = |out_file: &str| {
+        // Execute a single token: cmd.sh is already run by bash, so we
+        // simply emit a literal redirection that captures $TREN_NS.
+        let cmd = format!("printf %s $TREN_NS > {}", out_file);
+        let st = Command::new(qbind_bin)
+            .args(&[&parent, "--", &cmd])
+            .current_dir(&sb.dir)
+            .output()
+            .expect("spawn qbind");
+        String::from_utf8_lossy(&st.stdout).trim().to_string()
+    };
+    let a1 = mk("ns1.txt");
+    let a2 = mk("ns2.txt");
+    assert_eq!(sb.qwait(&[&a1, &a2]), 0);
+    let n1 = std::fs::read_to_string(sb.dir.join("ns1.txt")).unwrap_or_default();
+    let n2 = std::fs::read_to_string(sb.dir.join("ns2.txt")).unwrap_or_default();
+    assert!(!n1.is_empty(), "TREN_NS empty in qbind1");
+    assert!(!n2.is_empty(), "TREN_NS empty in qbind2");
+    assert_ne!(n1, n2, "two qbind calls should yield distinct namespaces");
+}
+
+#[test]
+fn spill_name_format_3digit_then_4digit() {
+    use tren::{format_spill_name, parse_spill_seq};
+    assert_eq!(format_spill_name(0,    "abc"), ".tren-000-abc");
+    assert_eq!(format_spill_name(7,    "abc"), ".tren-007-abc");
+    assert_eq!(format_spill_name(999,  "abc"), ".tren-999-abc");
+    assert_eq!(format_spill_name(1000, "abc"), ".tren-1000-abc");
+    assert_eq!(format_spill_name(9999, "abc"), ".tren-9999-abc");
+    // Inverse parse.
+    assert_eq!(parse_spill_seq(".tren-000-abc"),  Some(0));
+    assert_eq!(parse_spill_seq(".tren-007-abc"),  Some(7));
+    assert_eq!(parse_spill_seq(".tren-1000-abc"), Some(1000));
+    // Legacy: name without numeric prefix → None.
+    assert_eq!(parse_spill_seq(".tren-deadbeef"), None);
+}
+
+#[test]
+fn spillover_creates_second_spill_past_32_leaves() {
+    // Submit enough no-op jobs to fill one spill (cap = 32 leaves =
+    // SPILL_NODE_CAP nodes). The 65th submit must land in a freshly
+    // spawned sibling spill.
+    let sb = Sandbox::new("spillover");
+    let cap = tren::SPILL_NODE_CAP as usize;
+
+    let mut handles = Vec::new();
+    for i in 0..(cap + 4) {
+        let dir = sb.dir.clone();
+        let qsub = QSUB.to_string();
+        handles.push(thread::spawn(move || {
+            Command::new(&qsub)
+                .arg(format!("echo s{} > /dev/null", i))
+                .current_dir(&dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .output()
+                .expect("qsub")
+        }));
+    }
+    for h in handles {
+        let out = h.join().expect("thread");
+        assert!(out.status.success(), "qsub failed");
+    }
+
+    // After at least cap+1 submits, a second spill must exist.
+    let mut spills: Vec<PathBuf> = Vec::new();
+    for ent in std::fs::read_dir(&sb.dir).expect("read sandbox") {
+        let ent = ent.expect("dirent");
+        let name = ent.file_name();
+        let s = name.to_string_lossy();
+        if s.starts_with(".tren-") && ent.file_type().unwrap().is_dir() {
+            spills.push(ent.path());
+        }
+    }
+    assert!(
+        spills.len() >= 2,
+        "spillover should have created at least 2 spills, found: {:?}",
+        spills,
+    );
+
+    // Best-effort: shut down every alive spill before sandbox drop so the
+    // wrapper child processes don't leak.
+    for s in &spills {
+        if let Ok(p) = std::fs::read_to_string(s.join("port")) {
+            if let Ok(port) = p.trim().parse::<u16>() {
+                let _ = tren::send_quit(port);
+            }
+        }
+    }
+    thread::sleep(Duration::from_millis(200));
+}
