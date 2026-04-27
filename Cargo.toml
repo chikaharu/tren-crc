@@ -26,6 +26,11 @@
   path              = "examples/bench_crc_impls.rs"
   required-features = ["experimental"]
 
+  [[example]]
+  name              = "exp_diagonal_entropy"
+  path              = "examples/exp_diagonal_entropy.rs"
+  required-features = ["experimental"]
+
   [[bin]]
   name = "tren-wrapper"
   path = "src/bin/tren_wrapper.rs"
