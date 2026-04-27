@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [develop, experiment, future, main]
+  pull_request:
+    branches: [develop, experiment, future, main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+      - name: cargo build
+        run: cargo build --all-targets
+      - name: cargo test (default)
+        run: cargo test
+        timeout-minutes: 15
+      - name: cargo test (--features model)
+        run: cargo test --features model
+        timeout-minutes: 15
