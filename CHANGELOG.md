@@ -11,6 +11,35 @@
 
   ## [Unreleased]
 
+  ### Removed
+
+  - **Experimental research harness extracted to its own crate.**
+    All `src/research/*` modules (`bench`, `bool_ops`, `crc_impls`, `data`,
+    `entropy_sweep`, `inject`, `parity_layer`, `scatter`, `stats`), the three
+    experimental examples (`exp_diagonal_entropy`, `exp_even_bit`,
+    `bench_crc_impls`), and their docs (`docs/research/*`) have been moved to
+    the new standalone repository
+    [chikaharu/frame32-scatter](https://github.com/chikaharu/frame32-scatter)
+    (`v0.1.0`). The `experimental` cargo feature and the optional `rand`
+    dependency are removed accordingly. Consumers who want to run the research
+    harness should depend on `frame32-scatter` directly:
+
+    ```toml
+    [dev-dependencies]
+    frame32-scatter = "0.1"
+    ```
+
+    `tren-crc` itself still includes a `[dev-dependencies] frame32-scatter`
+    entry pinning to the new repo so future research work can reuse it without
+    re-creating the harness here. Default builds and `--features model` builds
+    are unchanged.
+
+  ### Changed
+
+  - Package version bumped to `0.5.0-crc.3`.
+
+  ## [v0.5.0-crc.2] - 2026-04-27
+
   ### Added
 
   - **Experimental research harness** (`src/research/`, gated behind the new `experimental` cargo feature).
@@ -121,4 +150,5 @@
   5. Create a GitHub Release pointing to the tag.
 
   [v0.5.0-crc.1]: https://github.com/chikaharu/tren-crc/releases/tag/v0.5.0-crc.1
+  [v0.5.0-crc.2]: https://github.com/chikaharu/tren-crc/releases/tag/v0.5.0-crc.2
   
