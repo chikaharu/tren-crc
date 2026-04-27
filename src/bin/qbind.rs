@@ -1,13 +1,13 @@
 //! qbind — gather: submit a job that runs after every listed dependency
-//! finishes successfully.
+//! finishes successfully. Each invocation allocates a fresh namespace
+//! token (logical group tag) under the active spill.
 //!
 //! Usage:
 //!   qbind <addr1> [<addr2>...] -- <cmd> [args...]
 
 use std::path::PathBuf;
-use std::time::Duration;
 
-use tren::{connect_or_spawn, encode_text, udp_request};
+use tren::submit_cmd;
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -31,26 +31,17 @@ fn main() {
         std::process::exit(2);
     }
 
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let (workdir, port) = match connect_or_spawn(&cwd, true) {
-        Ok(p) => p,
-        Err(e) => { eprintln!("qbind: {}", e); std::process::exit(1); }
-    };
-
     let cmd_str = cmd.join(" ");
-    let req = format!("SUBMIT\n{}\n{}\n", deps.join(" "), encode_text(&cmd_str));
-    match udp_request(port, &req, Duration::from_secs(5)) {
-        Ok(reply) => {
-            let r = reply.trim();
-            if let Some(addr) = r.strip_prefix("OK ") {
-                println!("{}", addr);
-                eprintln!("[qbind] node {}  deps {:?}  workdir {}",
-                    addr, deps, workdir.display());
-            } else {
-                eprintln!("qbind: {}", r);
-                std::process::exit(1);
-            }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
+    let ns = tren::fresh_token();
+    let body = format!("export TREN_NS={}\n{}", ns, cmd_str);
+
+    match submit_cmd(&cwd, &deps, &body) {
+        Ok(r) => {
+            println!("{}", r.addr);
+            eprintln!("[qbind] node {}  ns={}  deps {:?}  workdir {}",
+                r.addr, ns, deps, r.workdir.display());
         }
-        Err(e) => { eprintln!("qbind: udp: {}", e); std::process::exit(1); }
+        Err(e) => { eprintln!("qbind: {}", e); std::process::exit(1); }
     }
 }

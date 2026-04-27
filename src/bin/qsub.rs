@@ -6,20 +6,13 @@
 //!   qsub --after <addr> [<addr>...] -- <cmd> [args...]
 //!   qsub --owner <name> <cmd>             # forwarded as TREN_OWNER env
 //!
-//! If no `.tren-<uuid>/` is present in (or above) cwd, the wrapper is
-//! auto-spawned. After SUBMIT succeeds, the new node's bit address is
-//! printed on stdout and `qsub` then waits for that node to reach a
-//! finished state, prints `[qsub] exit=N` on stderr, and exits with that
-//! same code (0 on `DONE(0)`, 1 on `DONE(N>0)` or `FAILED(_)`).
-//!
-//! This makes `qsub` behave like an ordinary shell command: every
-//! invocation blocks until *its own* job is done, including in chains
-//! built with `--after`.
+//! v0.3 protocol: the command body is shipped through the filesystem
+//! inbox (`<workdir>/inbox/<token>.sh`) and the binary SUBMIT frame
+//! carries only the deps + the inbox token.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
-use tren::{connect_or_spawn, encode_text, udp_request, wait_for_addrs};
+use tren::{submit_cmd, wait_for_addrs};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -61,38 +54,22 @@ fn main() {
     }
 
     let cmd_str = if let Some(o) = owner.as_ref() {
-        // Owner forwarded via env; out-of-scope wrapper just exposes
-        // TREN_OWNER inside the executed shell.
-        format!("TREN_OWNER={} {}", o, cmd.join(" "))
+        format!("export TREN_OWNER={}\n{}", o, cmd.join(" "))
     } else {
         cmd.join(" ")
     };
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let (workdir, port) = match connect_or_spawn(&cwd, true) {
-        Ok(p) => p,
-        Err(e) => { eprintln!("qsub: cannot connect to wrapper: {}", e); std::process::exit(1); }
+    let res = match submit_cmd(&cwd, &deps, &cmd_str) {
+        Ok(r)  => r,
+        Err(e) => { eprintln!("qsub: {}", e); std::process::exit(1); }
     };
 
-    let req = format!("SUBMIT\n{}\n{}\n", deps.join(" "), encode_text(&cmd_str));
-    let addr = match udp_request(port, &req, Duration::from_secs(5)) {
-        Ok(reply) => {
-            let r = reply.trim().to_string();
-            if let Some(addr) = r.strip_prefix("OK ") {
-                println!("{}", addr);
-                eprintln!("[qsub] node {}  workdir {}", addr, workdir.display());
-                addr.to_string()
-            } else {
-                eprintln!("qsub: {}", r);
-                std::process::exit(1);
-            }
-        }
-        Err(e) => { eprintln!("qsub: udp error: {}", e); std::process::exit(1); }
-    };
+    println!("{}", res.addr);
+    eprintln!("[qsub] node {}  workdir {}", res.addr, res.workdir.display());
 
-    // Implicit qwait on the address we just submitted.
-    let targets = vec![addr.clone()];
-    let failed_any = match wait_for_addrs(&workdir, port, &targets, false, "qsub") {
+    let targets = vec![res.addr.clone()];
+    let failed_any = match wait_for_addrs(&res.workdir, res.port, &targets, false, "qsub") {
         Ok((f, _)) => f,
         Err(e) => {
             eprintln!("qsub: wait error: {}", e);

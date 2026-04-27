@@ -1,5 +1,6 @@
 //! qmap — scatter: submit one job per item, substituting `{}` with each
-//! item in `<cmd_template>`.
+//! item in `<cmd_template>`. Each invocation allocates a fresh namespace
+//! token shared by all sub-jobs.
 //!
 //! Usage:
 //!   qmap <items_file_or_colon_list> <cmd_template>
@@ -7,9 +8,8 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
 
-use tren::{connect_or_spawn, encode_text, udp_request};
+use tren::submit_cmd;
 
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -57,27 +57,17 @@ fn main() {
     }
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp"));
-    let (_workdir, port) = match connect_or_spawn(&cwd, true) {
-        Ok(p) => p,
-        Err(e) => { eprintln!("qmap: {}", e); std::process::exit(1); }
-    };
-
+    let ns = tren::fresh_token();
     let mut addrs: Vec<String> = Vec::new();
     for item in &items {
         let cmd = template.replace("{}", item);
-        let req = format!("SUBMIT\n{}\n{}\n", deps.join(" "), encode_text(&cmd));
-        match udp_request(port, &req, Duration::from_secs(5)) {
-            Ok(reply) => {
-                let r = reply.trim();
-                if let Some(a) = r.strip_prefix("OK ") {
-                    addrs.push(a.to_string());
-                    eprintln!("[qmap] {}  cmd: {}", a, cmd);
-                } else {
-                    eprintln!("qmap: SUBMIT failed: {}", r);
-                    std::process::exit(1);
-                }
+        let body = format!("export TREN_NS={}\n{}", ns, cmd);
+        match submit_cmd(&cwd, &deps, &body) {
+            Ok(r) => {
+                addrs.push(r.addr.clone());
+                eprintln!("[qmap] {}  ns={}  cmd: {}", r.addr, ns, cmd);
             }
-            Err(e) => { eprintln!("qmap: udp: {}", e); std::process::exit(1); }
+            Err(e) => { eprintln!("qmap: {}", e); std::process::exit(1); }
         }
     }
     println!("{}", addrs.join(" "));
