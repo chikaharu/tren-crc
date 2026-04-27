@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# pre-commit: enforce alternation between `develop` and `experiment`.
+#
+# Rule: if the current branch is `develop` or `experiment`, the commit
+# being created must NOT have a parent that was authored on the same
+# branch (where "authored-on" is determined by the `Authored-on:` trailer
+# of the parent commit message). This forces every consecutive pair of
+# work commits to alternate branches.
+#
+# See COMMIT_RULE.md.
+
+set -e
+
+branch="$(git symbolic-ref --short -q HEAD || true)"
+
+if [ "$branch" != "develop" ] && [ "$branch" != "experiment" ]; then
+    exit 0
+fi
+
+# Allow the very first commit on a branch (no HEAD^).
+if ! git rev-parse --verify -q HEAD^{commit} >/dev/null 2>&1; then
+    exit 0
+fi
+
+parent_msg="$(git log -1 --pretty=%B HEAD)"
+parent_authored_on="$(printf '%s\n' "$parent_msg" | sed -n 's/^Authored-on:[[:space:]]*//p' | tail -n1 | tr -d '[:space:]')"
+
+if [ -z "$parent_authored_on" ]; then
+    # Parent is a non-relay commit (e.g. initial import or PR-merge into
+    # main/future). Permit, since alternation only constrains adjacency
+    # within develop/experiment work.
+    exit 0
+fi
+
+if [ "$parent_authored_on" = "$branch" ]; then
+    cat >&2 <<EOF
+[pre-commit] Relay violation: HEAD ($branch) is at a commit authored on
+the same branch ($parent_authored_on). The next work commit must be
+authored on the OTHER branch.
+
+Recommended fix:
+  git stash --keep-index    # or git stash -u
+  git checkout $([ "$branch" = "develop" ] && echo experiment || echo develop)
+  git stash pop
+  git add -A && git commit  # commit there, then ff-merge back
+
+See COMMIT_RULE.md for details.
+EOF
+    exit 1
+fi
+
+exit 0
