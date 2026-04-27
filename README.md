@@ -13,6 +13,10 @@ This repository is a fork of `chikaharu/tren` at v0.4.0 (commit
 CRC32C frame protocol. Upstream `chikaharu/tren` is left untouched;
 integration of this variant back into upstream is a separate decision.
 
+## Changelog
+
+See **[CHANGELOG.md](./CHANGELOG.md)** for a history of notable changes in this fork.
+
 ---
 
 ## scheduler/ — tren-crc job scheduler (in-repo single source of truth)
